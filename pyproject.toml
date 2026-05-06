@@ -1,0 +1,34 @@
+[project]
+name = "sgs-flow-matching"
+version = "0.1.0"
+description = "SE(3)-Equivariant Flow Matching for SGS Closure in LES — EPITA DSA 2026"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1.0",
+    "e3nn>=0.5.1",
+    "torchdiffeq>=0.2.3",
+    "torch-geometric>=2.4.0",
+    "numpy>=1.24.0",
+    "scipy>=1.11.0",
+    "h5py>=3.9.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.65.0",
+    "matplotlib>=3.7.0",
+]
+
+[project.optional-dependencies]
+jhtdb = ["pyJHTDB>=20230505"]
+
+[project.scripts]
+sgs-train = "train:main"
+sgs-eval  = "evaluate:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+sources = ["src"]
+
+[dependency-groups]
+dev = []
