@@ -4,6 +4,7 @@ Supports both the pyJHTDB web service and pre-downloaded local HDF5 files.
 DNS: 1024^3, Gaussian-filtered to 64^3 LES grid.
 """
 
+import os
 import numpy as np
 import torch
 import h5py
@@ -134,7 +135,7 @@ class JHTDBLoader:
     DX_DNS = 2 * np.pi / 1024
 
     def __init__(self, token: str = "", cache_dir: str = "./jhtdb_cache"):
-        self.token = token
+        self.token = token or os.environ.get("JHTDB_TOKEN", "")
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._api = None
