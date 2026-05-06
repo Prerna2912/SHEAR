@@ -83,6 +83,10 @@ def main() -> None:
         "--time-indices", nargs="+", type=int, default=[0],
         help="Time snapshot indices to download (default: 0)",
     )
+    parser.add_argument(
+        "--test", action="store_true",
+        help="Run a minimal connectivity test only (works with testing token)",
+    )
     args = parser.parse_args()
 
     # Load .env if present
@@ -104,6 +108,16 @@ def main() -> None:
 
     print(f"Token   : {token[:12]}…")
     print(f"Cache   : {cache_dir.resolve()}")
+
+    from data.jhtdb import JHTDBLoader
+    loader = JHTDBLoader(token=token, cache_dir=str(cache_dir))
+
+    if args.test:
+        print("Running connectivity test (16³ = 4096-point query) …")
+        loader.test_connection()
+        print("Test passed.")
+        return
+
     print(f"Indices : {args.time_indices}")
     fetch_and_preprocess(token, cache_dir, args.time_indices)
     print("Done.")

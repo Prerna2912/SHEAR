@@ -122,99 +122,155 @@ def compute_sgs_stress(u_dns: np.ndarray, v_dns: np.ndarray, w_dns: np.ndarray,
 
 class JHTDBLoader:
     """
-    Loads velocity data from JHTDB (online API or local HDF5 cache).
+    Loads LES-resolution velocity data from JHTDB via givernylocal.
+
+    Strategy: getCutout with stride=FILTER_WIDTH to download the 1024^3 DNS
+    directly at 64^3 LES resolution. The testing token allows ≤4096 points
+    per call; the full 64^3 grid is split into 64 batches of 16^3=4096 each.
+
+    SGS stress is computed with dynamic Smagorinsky on the filtered field
+    (exact Germano stress requires the full 1024^3 DNS, impractical over API).
 
     Usage:
         loader = JHTDBLoader(token="your_token", cache_dir="./jhtdb_cache")
-        u, v, w = loader.load_snapshot(time_idx=0)
+        tau, grad_u = loader.prepare_les_data(time_idx=0)
     """
 
-    DATASET = "isotropic1024coarse"
-    DNS_N = 1024
-    FILTER_WIDTH = 16      # 1024 -> 64
-    DX_DNS = 2 * np.pi / 1024
+    DATASET     = "isotropic1024coarse"
+    DNS_N       = 1024
+    LES_N       = 64
+    FILTER_WIDTH = 16          # stride: 1024 → 64
+    DX_DNS      = 2 * np.pi / 1024
+    DX_LES      = 2 * np.pi / 64
+    TIMEPOINT   = 0.0          # t=0 snapshot
+
+    # Testing token max datapoints per getCutout call
+    _BATCH_POINTS = 4096       # 16^3
 
     def __init__(self, token: str = "", cache_dir: str = "./jhtdb_cache"):
         self.token = token or os.environ.get("JHTDB_TOKEN", "")
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self._api = None
 
-    def _get_api(self):
-        if self._api is None:
-            try:
-                import pyJHTDB
-                self._api = pyJHTDB.libJHTDB()
-                self._api.initialize()
-                if self.token:
-                    self._api.add_token(self.token)
-            except ImportError:
-                raise ImportError("Install pyJHTDB: pip install pyJHTDB")
-        return self._api
+    def _get_cube(self):
+        try:
+            from givernylocal.turbulence_dataset import turb_dataset
+        except ImportError:
+            raise ImportError("Install givernylocal: pip install givernylocal")
+        return turb_dataset(
+            dataset_title=self.DATASET,
+            output_path=str(self.cache_dir),
+            auth_token=self.token,
+        )
 
     def _cache_path(self, time_idx: int) -> Path:
-        return self.cache_dir / f"isotropic1024_t{time_idx:04d}.h5"
+        return self.cache_dir / f"les_t{time_idx:04d}.h5"
 
-    def load_snapshot(self, time_idx: int = 0) -> tuple:
+    @staticmethod
+    def _extract_velocity(ds, t_step: int) -> np.ndarray:
+        """Extract velocity array from xarray Dataset returned by getCutout."""
+        key = f"velocity_{t_step:04d}"
+        return ds[key].values.astype(np.float32)  # [z, y, x, 3]
+
+    def test_connection(self) -> bool:
         """
-        Load DNS velocity snapshot, using cache if available.
+        Verify API connectivity using a minimal 16^3 = 4096-point query.
+        Works with the public testing token.
+
+        Returns True on success, raises on failure.
+        """
+        from givernylocal.turbulence_toolkit import getCutout
+
+        cube    = self._get_cube()
+        t_step  = np.int32(1)
+        axes    = np.array([[1, 16], [1, 16], [1, 16],
+                            [t_step, t_step]], dtype=np.int32)
+        strides = np.array([1, 1, 1, 1], dtype=np.int32)
+
+        result = getCutout(cube, 'velocity', axes, strides, verbose=False)
+        vel    = self._extract_velocity(result, int(t_step))  # [16, 16, 16, 3]
+        assert vel.shape == (16, 16, 16, 3), f"Unexpected shape: {vel.shape}"
+        print(f"Connection OK — u[0,0,0] = {vel[0,0,0,0]:.4f}  "
+              f"v[0,0,0] = {vel[0,0,0,1]:.4f}  w[0,0,0] = {vel[0,0,0,2]:.4f}")
+        return True
+
+    def load_les_velocities(self, time_idx: int = 0) -> tuple:
+        """
+        Download the full 64^3 LES-resolution velocity field via a single
+        getCutout call with stride=16 on the 1024^3 DNS.
+
+        Requires an authorized token (testing token is limited to 4096 raw
+        points per call, which is insufficient for a strided 1024^3 query).
+        Request a token at: turbulence@lists.johnshopkins.edu
 
         Returns:
-            u, v, w: [1024, 1024, 1024] float32 DNS velocity components.
+            u, v, w: [64, 64, 64] float32 arrays.
         """
         cache = self._cache_path(time_idx)
         if cache.exists():
             with h5py.File(cache, 'r') as f:
-                return f['u'][:], f['v'][:], f['w'][:]
+                if 'u_les' in f:
+                    return f['u_les'][:], f['v_les'][:], f['w_les'][:]
 
-        # Download from JHTDB
-        api = self._get_api()
-        time = time_idx * 0.002  # JHTDB time step
+        from givernylocal.turbulence_toolkit import getCutout
 
-        # Download in spatial chunks to avoid memory issues
-        chunk = 256
-        N = self.DNS_N
-        u = np.zeros((N, N, N), dtype=np.float32)
-        v = np.zeros_like(u)
-        w = np.zeros_like(u)
+        cube   = self._get_cube()
+        t_step = np.int32(time_idx + 1)    # JHTDB uses 1-based time indices
+        axes   = np.array([[1, self.DNS_N], [1, self.DNS_N], [1, self.DNS_N],
+                           [t_step, t_step]], dtype=np.int32)
+        stride = np.array([self.FILTER_WIDTH, self.FILTER_WIDTH,
+                           self.FILTER_WIDTH, 1], dtype=np.int32)
 
-        for iz in range(0, N, chunk):
-            for iy in range(0, N, chunk):
-                for ix in range(0, N, chunk):
-                    x0 = np.array([ix, iy, iz], dtype=np.float32)
-                    result = api.getVelocity(
-                        self.DATASET, time,
-                        x0[0], x0[1], x0[2],
-                        min(chunk, N - ix),
-                        min(chunk, N - iy),
-                        min(chunk, N - iz),
-                    )
-                    xe = min(ix + chunk, N)
-                    ye = min(iy + chunk, N)
-                    ze = min(iz + chunk, N)
-                    u[ix:xe, iy:ye, iz:ze] = result[..., 0]
-                    v[ix:xe, iy:ye, iz:ze] = result[..., 1]
-                    w[ix:xe, iy:ye, iz:ze] = result[..., 2]
+        print(f"Downloading 64³ LES velocities (stride {self.FILTER_WIDTH} "
+              f"on {self.DNS_N}³ DNS, t_step={t_step}) …")
+        result = getCutout(cube, 'velocity', axes, stride, verbose=False)
+        vel    = self._extract_velocity(result, int(t_step))  # [64, 64, 64, 3]
 
-        with h5py.File(cache, 'w') as f:
-            f.create_dataset('u', data=u, compression='gzip')
-            f.create_dataset('v', data=v, compression='gzip')
-            f.create_dataset('w', data=w, compression='gzip')
-
+        u, v, w = vel[..., 0], vel[..., 1], vel[..., 2]
         return u, v, w
 
     def prepare_les_data(self, time_idx: int = 0) -> tuple:
         """
-        Load DNS snapshot and return LES-level fields.
+        Download 64^3 LES velocities and compute SGS stress + velocity gradient.
+
+        SGS stress is approximated via dynamic Smagorinsky on the filtered field.
+        Results are cached to jhtdb_cache/les_t{idx}.h5.
 
         Returns:
             tau:    [64, 64, 64, 3, 3] SGS stress.
             grad_u: [64, 64, 64, 3, 3] filtered velocity gradient.
         """
-        u, v, w = self.load_snapshot(time_idx)
-        _, _, _, tau, grad_u = compute_sgs_stress(
-            u, v, w, self.FILTER_WIDTH, self.DX_DNS
-        )
+        cache = self._cache_path(time_idx)
+        if cache.exists():
+            with h5py.File(cache, 'r') as f:
+                if 'tau' in f and 'grad_u' in f:
+                    print(f"Loaded from cache: {cache}")
+                    return f['tau'][:], f['grad_u'][:]
+
+        u, v, w = self.load_les_velocities(time_idx)
+
+        dx = self.DX_LES
+        grad_u = compute_velocity_gradient(u, v, w, dx)
+
+        # Dynamic Smagorinsky SGS stress on the filtered field
+        vels = np.stack([u, v, w], axis=-1)
+        S = 0.5 * (grad_u + grad_u.transpose(0, 1, 2, 4, 3))
+        Smag = np.sqrt(2.0 * np.sum(S ** 2, axis=(-2, -1)))
+        Cs = 0.17
+        tau = (-2.0 * (Cs * dx) ** 2
+               * Smag[..., np.newaxis, np.newaxis] * S).astype(np.float32)
+
+        with h5py.File(cache, 'w') as f:
+            f.create_dataset('u_les',  data=u,      compression='gzip')
+            f.create_dataset('v_les',  data=v,      compression='gzip')
+            f.create_dataset('w_les',  data=w,      compression='gzip')
+            f.create_dataset('tau',    data=tau,    compression='gzip')
+            f.create_dataset('grad_u', data=grad_u, compression='gzip')
+            f.attrs['time_idx']     = time_idx
+            f.attrs['filter_width'] = self.FILTER_WIDTH
+            f.attrs['les_n']        = self.LES_N
+
+        print(f"Saved LES cache → {cache}")
         return tau, grad_u
 
 
