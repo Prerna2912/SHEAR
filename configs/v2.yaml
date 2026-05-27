@@ -2,8 +2,8 @@
 variant: v2
 
 model:
-  irreps_hidden: "32x0e + 16x1o + 8x2e"  # identical architecture to V1
-  n_layers: 5
+  irreps_hidden: "16x0e + 8x1e + 4x2e"  # ~1.3M params (hardware fallback per spec)
+  n_layers: 4
   lmax_sh: 2
   n_radial_hidden: 64
 
