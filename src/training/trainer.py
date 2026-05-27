@@ -239,6 +239,7 @@ class Trainer:
                       f"loss={loss:.6f} | "
                       f"lr={self.optimizer.param_groups[0]['lr']:.2e} | "
                       f"elapsed={elapsed:.0f}s")
+                self._save_checkpoint('last.pt')
 
             if self.global_step % self.val_every == 0:
                 val_loss = self._validate()
