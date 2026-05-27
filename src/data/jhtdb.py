@@ -39,7 +39,7 @@ def gaussian_filter_3d(u: np.ndarray, filter_width: int) -> np.ndarray:
     kz = np.fft.rfftfreq(N, d=1.0 / N).astype(np.float32)
     KX, KY, KZ = np.meshgrid(kx, ky, kz, indexing='ij')
     k2 = KX**2 + KY**2 + KZ**2
-    sigma2 = (filter_width / (2 * np.pi))**2 / 24.0
+    sigma2 = (filter_width * 2 * np.pi / N) ** 2 / 24.0
     G = np.exp(-k2 * sigma2)
 
     u_hat_filtered = u_hat * G
@@ -377,7 +377,8 @@ class JHTDBLoader:
         fw, N, _ = u_slab.shape
         M   = self.LES_N          # 64
         km  = M // 2              # 32
-        sig = (self.FILTER_WIDTH / (2 * np.pi))**2 / 24.0
+        # Δ = filter_width × dx_dns = filter_width × 2π/N_dns; sig = Δ²/24
+        sig = (self.FILTER_WIDTH * 2 * np.pi / self.DNS_N) ** 2 / 24.0
         k   = np.fft.rfftfreq(N, d=1.0 / N).astype(np.float32)   # [N//2+1]
         G   = np.exp(-k**2 * sig).astype(np.float32)
 
@@ -407,7 +408,7 @@ class JHTDBLoader:
         N   = self.DNS_N          # 1024
         M   = self.LES_N          # 64
         km  = M // 2              # 32
-        sig = (self.FILTER_WIDTH / (2 * np.pi))**2 / 24.0
+        sig = (self.FILTER_WIDTH * 2 * np.pi / self.DNS_N) ** 2 / 24.0
         k   = np.fft.rfftfreq(N, d=1.0 / N).astype(np.float32)
         G   = np.exp(-k**2 * sig).astype(np.float32)
 
