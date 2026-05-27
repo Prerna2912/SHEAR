@@ -22,6 +22,7 @@ Output:
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as grad_ckpt
 from e3nn import o3
 from e3nn.nn import BatchNorm as E3BatchNorm
 from torch_geometric.nn import MessagePassing
@@ -198,7 +199,10 @@ class SE3EquivariantEGNN(nn.Module):
         h = self.embed(node_feat)
 
         for layer in self.layers:
-            h = layer(h, pos, edge_index)
+            if self.training:
+                h = grad_ckpt(layer, h, pos, edge_index, use_reentrant=False)
+            else:
+                h = layer(h, pos, edge_index)
 
         return self.output(h)   # [N, 6]
 
