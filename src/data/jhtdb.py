@@ -283,17 +283,19 @@ class JHTDBLoader:
 
         Algorithm (separability of Gaussian: G_3D = G_x · G_y · G_z):
           For each z-slab [fw, N, N, 3]:
-            1. 1D Gaussian filter + downsample along x → [fw, N, M]
-            2. 1D Gaussian filter + downsample along y → [fw, M, M]
-            3. Accumulate into [N, M, M] intermediate (stack all slabs)
+            1. Download in x-tiles (256×1024×16 each, ~48 MB — within API limit)
+            2. 1D Gaussian filter + downsample along x → [fw, N, M]
+            3. 1D Gaussian filter + downsample along y → [fw, M, M]
+            4. Write result to progress HDF5 on Drive (survives session restarts)
           After all slabs:
-            4. 1D Gaussian filter + downsample along z → [M, M, M]
+            5. 1D Gaussian filter + downsample along z → [M, M, M]
           Finally:
-            5. τᵢⱼ = bar(uᵢuⱼ) − bar(uᵢ)·bar(uⱼ)
+            6. τᵢⱼ = bar(uᵢuⱼ) − bar(uᵢ)·bar(uⱼ)
 
-        Download: 64 slabs × ~200 MB ≈ 12.9 GB total.
-        Peak RAM per slab: ~300 MB.
+        Progress is checkpointed to Drive after each slab so a disconnected
+        session can resume where it stopped rather than re-downloading from slab 1.
         """
+        import gc
         from givernylocal.turbulence_toolkit import getCutout
 
         cube   = self._get_cube()
@@ -306,43 +308,91 @@ class JHTDBLoader:
         PAIRS = [(0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 2)]
         n_c, n_p = 3, len(PAIRS)
 
-        # Accumulators: store x,y-filtered slabs before z-filter
-        # Shape [n_slabs, fw, M, M, n_c/n_p]; reshape to [N, M, M, n_c/n_p] for z-filter
-        vel_inter  = np.zeros((n_slabs, fw, M, M, n_c), dtype=np.float32)
-        prod_inter = np.zeros((n_slabs, fw, M, M, n_p), dtype=np.float32)
+        # x-axis tiling: 4 tiles of 256×1024×16 = 4.2M pts each (~48 MB),
+        # well within givernylocal's safe ~8M point / 100 MB per-call limit.
+        X_TILE   = 256
+        n_xtiles = N // X_TILE
+        strides  = np.ones(4, dtype=np.int32)
+
+        # Progress file lives in cache_dir (Google Drive in Colab) so it
+        # survives a session restart.  Each slab's xy-filtered result is
+        # written here immediately; on resume, completed slabs are skipped.
+        progress_path = self.cache_dir / f"les_t{time_idx:04d}_progress.h5"
+
+        with h5py.File(progress_path, 'a') as pf:
+            if 'vel_inter' not in pf:
+                pf.create_dataset('vel_inter',
+                                  shape=(n_slabs, fw, M, M, n_c),
+                                  dtype='float32',
+                                  chunks=(1, fw, M, M, n_c))
+                pf.create_dataset('prod_inter',
+                                  shape=(n_slabs, fw, M, M, n_p),
+                                  dtype='float32',
+                                  chunks=(1, fw, M, M, n_p))
+                pf.create_dataset('slab_done',
+                                  data=np.zeros(n_slabs, dtype=bool))
+            slab_done = pf['slab_done'][:]
+
+        n_done = int(slab_done.sum())
+        if n_done > 0:
+            print(f"  Resuming: {n_done}/{n_slabs} slabs already on Drive, "
+                  f"starting from slab {n_done + 1}.")
 
         for k in range(n_slabs):
+            if slab_done[k]:
+                continue
+
             z0 = k * fw + 1
             z1 = (k + 1) * fw
-            axes = np.array(
-                [[1, N], [1, N], [z0, z1], [t_step, t_step]], dtype=np.int32
-            )
-            strides = np.ones(4, dtype=np.int32)
-
-            print(f"\r  z-slab {k + 1:2d}/{n_slabs}  "
+            print(f"  z-slab {k + 1:2d}/{n_slabs}  "
                   f"(DNS z={z0}–{z1}, {(k + 1) / n_slabs * 100:.0f}%)",
-                  end="", flush=True)
+                  flush=True)
 
-            res = getCutout(cube, 'velocity', axes, strides, verbose=False)
-            vel = np.ascontiguousarray(
-                self._extract_velocity(res, int(t_step))   # [fw, N, N, 3]
+            # Assemble slab from x-tiles
+            vel = np.empty((fw, N, N, 3), dtype=np.float32)
+            for tx in range(n_xtiles):
+                x0 = tx * X_TILE + 1    # JHTDB is 1-indexed
+                x1 = (tx + 1) * X_TILE
+                tile_axes = np.array(
+                    [[x0, x1], [1, N], [z0, z1], [t_step, t_step]],
+                    dtype=np.int32,
+                )
+                tile_res = getCutout(cube, 'velocity', tile_axes, strides,
+                                     verbose=False)
+                vel[:, :, tx * X_TILE:(tx + 1) * X_TILE, :] = \
+                    self._extract_velocity(tile_res, int(t_step))
+
+            # Apply xy Gaussian filter
+            vel_xy  = np.stack(
+                [self._gaussian_filter_xy(vel[..., c]) for c in range(n_c)],
+                axis=-1,
             )
-
-            for c in range(n_c):
-                vel_inter[k, ..., c] = self._gaussian_filter_xy(vel[..., c])
-
-            for idx, (i, j) in enumerate(PAIRS):
-                uiuj = (vel[..., i].astype(np.float64)
-                        * vel[..., j].astype(np.float64)).astype(np.float32)
-                prod_inter[k, ..., idx] = self._gaussian_filter_xy(uiuj)
-                del uiuj
-
+            prod_xy = np.stack(
+                [self._gaussian_filter_xy(
+                    (vel[..., i].astype(np.float64)
+                     * vel[..., j].astype(np.float64)).astype(np.float32))
+                 for (i, j) in PAIRS],
+                axis=-1,
+            )
             del vel
+            gc.collect()
+
+            # Checkpoint to Drive
+            with h5py.File(progress_path, 'a') as pf:
+                pf['vel_inter'][k]  = vel_xy
+                pf['prod_inter'][k] = prod_xy
+                pf['slab_done'][k]  = True
+
+            del vel_xy, prod_xy
 
         print()
 
-        # Reshape [n_slabs, fw, M, M] → [N, M, M] and apply z-direction filter
+        # All slabs complete — load from Drive and apply z-filter
         print("  Applying z-direction Gaussian filter …")
+        with h5py.File(progress_path, 'r') as pf:
+            vel_inter  = pf['vel_inter'][:]   # [n_slabs, fw, M, M, n_c]
+            prod_inter = pf['prod_inter'][:]  # [n_slabs, fw, M, M, n_p]
+
         vel_z  = vel_inter.reshape(N, M, M, n_c)
         prod_z = prod_inter.reshape(N, M, M, n_p)
         del vel_inter, prod_inter
@@ -362,6 +412,7 @@ class JHTDBLoader:
             tau[..., i, j] = t_ij
             tau[..., j, i] = t_ij
 
+        progress_path.unlink(missing_ok=True)
         return tau, u_les[..., 0], u_les[..., 1], u_les[..., 2]
 
     def _gaussian_filter_xy(self, u_slab: np.ndarray) -> np.ndarray:
