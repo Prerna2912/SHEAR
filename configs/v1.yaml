@@ -17,7 +17,8 @@ training:
   val_every: 500
   log_every: 100
   grad_clip: 1.0
-  batch_size: 32
+  batch_size: 8
+  accumulation_steps: 4  # effective batch = 32
 
 data:
   n_train: 4000

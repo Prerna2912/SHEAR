@@ -47,6 +47,7 @@ class Trainer:
         val_every=500,
         log_every=100,
         grad_clip=1.0,
+        accumulation_steps=1,
     )
 
     def __init__(
@@ -72,6 +73,7 @@ class Trainer:
         self.val_every = hparams['val_every']
         self.log_every = hparams['log_every']
         self.grad_clip = hparams['grad_clip']
+        self.accumulation_steps = int(hparams.get('accumulation_steps', 1))
 
         self.optimizer = AdamW(
             model.parameters(),
@@ -144,33 +146,33 @@ class Trainer:
     # Single training step
     # ------------------------------------------------------------------
 
-    def _train_step(self, batch) -> float:
-        self.model.train()
-        self.optimizer.zero_grad(set_to_none=True)
-
+    def _forward_loss(self, batch) -> torch.Tensor:
+        """Single forward pass; returns unscaled loss."""
         if self.variant == 'v1':
             batch = self._prepare_batch_v1(batch)
-            loss = self.model.loss(batch)
-
+            return self.model.loss(batch)
         elif self.variant == 'v2':
             batch = self._prepare_batch_v2(batch)
-            pred = self.model(
-                x=batch.x,
-                pos=batch.pos,
-                edge_index=batch.edge_index,
-            )
-            loss = mse_loss(pred, batch.y)
-
+            pred = self.model(x=batch.x, pos=batch.pos, edge_index=batch.edge_index)
+            return mse_loss(pred, batch.y)
         elif self.variant == 'v3':
             grad_irr, tau_irr = self._prepare_batch_v3(batch)
-            loss = self.model.loss(grad_irr, tau_irr)
+            return self.model.loss(grad_irr, tau_irr)
 
-        loss.backward()
+    def _train_step(self, batches: list) -> float:
+        """One optimizer update over `accumulation_steps` mini-batches."""
+        self.model.train()
+        self.optimizer.zero_grad(set_to_none=True)
+        total_loss = 0.0
+        for batch in batches:
+            loss = self._forward_loss(batch) / self.accumulation_steps
+            loss.backward()
+            total_loss += loss.item()
         nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
         self._apply_warmup()
         self.optimizer.step()
         self.scheduler.step()
-        return loss.item()
+        return total_loss
 
     # ------------------------------------------------------------------
     # Validation
@@ -216,14 +218,17 @@ class Trainer:
         loader_iter = iter(self.train_loader)
         t_start = time.time()
 
-        while self.global_step < self.total_steps:
+        def _next_batch():
+            nonlocal loader_iter
             try:
-                batch = next(loader_iter)
+                return next(loader_iter)
             except StopIteration:
                 loader_iter = iter(self.train_loader)
-                batch = next(loader_iter)
+                return next(loader_iter)
 
-            loss = self._train_step(batch)
+        while self.global_step < self.total_steps:
+            batches = [_next_batch() for _ in range(self.accumulation_steps)]
+            loss = self._train_step(batches)
             self.global_step += 1
             self.history['train_loss'].append(loss)
             self.history['lr'].append(self.optimizer.param_groups[0]['lr'])
