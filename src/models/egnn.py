@@ -199,10 +199,7 @@ class SE3EquivariantEGNN(nn.Module):
         h = self.embed(node_feat)
 
         for layer in self.layers:
-            if self.training:
-                h = grad_ckpt(layer, h, pos, edge_index, use_reentrant=False)
-            else:
-                h = layer(h, pos, edge_index)
+            h = layer(h, pos, edge_index)
 
         return self.output(h)   # [N, 6]
 
