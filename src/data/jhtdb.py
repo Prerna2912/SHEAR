@@ -231,13 +231,15 @@ class JHTDBLoader:
 
     def prepare_les_data(self, time_idx: int = 0) -> tuple:
         """
-        Download the full 1024^3 DNS velocity and compute the TRUE Leonard SGS stress:
-            τᵢⱼ = bar(uᵢ·uⱼ) − bar(uᵢ)·bar(uⱼ)
-        using a box filter of width filter_width=16 DNS cells per LES cell.
+        Compute the true Leonard SGS stress with the Gaussian LES filter:
+            G(k) = exp(−k²Δ²/24),  Δ = filter_width × dx_dns
 
-        Downloads in 64 z-slabs (~200 MB each, ~12.9 GB total) to stay within
-        memory limits. Requires an authorised JHTDB token for large cutouts.
-        Results are cached to HDF5 after the first call.
+        τᵢⱼ = bar(uᵢ·uⱼ) − bar(uᵢ)·bar(uⱼ)
+
+        The filter is applied as a separable 1D Gaussian along each spatial
+        direction (x→y→z), processing one z-slab at a time to avoid loading
+        the full 1024³ DNS field.  Peak memory per slab ≈ 300 MB.
+        Total download ≈ 12.9 GB; cached to HDF5 after the first call.
 
         Returns:
             tau:    [64, 64, 64, 3, 3] true SGS stress.
@@ -247,13 +249,13 @@ class JHTDBLoader:
         if cache.exists():
             with h5py.File(cache, 'r') as f:
                 if ('tau' in f and 'grad_u' in f
-                        and f.attrs.get('filter_type') == 'box_leonard'):
+                        and f.attrs.get('filter_type') == 'gaussian_leonard'):
                     print(f"Loaded from cache: {cache}")
                     return f['tau'][:], f['grad_u'][:]
-            print("Stale cache detected (old Smagorinsky approximation) — "
-                  "recomputing with true Leonard stress.")
+            print("Stale cache detected — recomputing with Gaussian-filtered "
+                  "Leonard stress.")
 
-        tau, u, v, w = self._compute_leonard_stress_chunked(time_idx)
+        tau, u, v, w = self._compute_leonard_stress_spectral(time_idx)
         grad_u = compute_velocity_gradient(u, v, w, self.DX_LES)
 
         with h5py.File(cache, 'w') as f:
@@ -265,80 +267,157 @@ class JHTDBLoader:
             f.attrs['time_idx']     = time_idx
             f.attrs['filter_width'] = self.FILTER_WIDTH
             f.attrs['les_n']        = self.LES_N
-            f.attrs['filter_type']  = 'box_leonard'
+            f.attrs['filter_type']  = 'gaussian_leonard'
 
         print(f"Saved LES cache → {cache}")
         return tau, grad_u
 
-    def _compute_leonard_stress_chunked(self, time_idx: int) -> tuple:
+    # ------------------------------------------------------------------
+    # Gaussian-filtered Leonard stress (separable 1D filter, slab-by-slab)
+    # ------------------------------------------------------------------
+
+    def _compute_leonard_stress_spectral(self, time_idx: int) -> tuple:
         """
-        Download the 1024^3 DNS velocity one z-slab at a time and compute
-        the true Leonard SGS stress with a box filter.
+        Download 1024³ DNS velocity in z-slabs and compute the true Leonard
+        SGS stress using the separable Gaussian spectral filter.
 
-        For each LES z-slice k, downloads DNS z ∈ [k·fw, (k+1)·fw) at full
-        x-y resolution (slab shape: [fw, 1024, 1024, 3] ≈ 200 MB).
+        Algorithm (separability of Gaussian: G_3D = G_x · G_y · G_z):
+          For each z-slab [fw, N, N, 3]:
+            1. 1D Gaussian filter + downsample along x → [fw, N, M]
+            2. 1D Gaussian filter + downsample along y → [fw, M, M]
+            3. Accumulate into [N, M, M] intermediate (stack all slabs)
+          After all slabs:
+            4. 1D Gaussian filter + downsample along z → [M, M, M]
+          Finally:
+            5. τᵢⱼ = bar(uᵢuⱼ) − bar(uᵢ)·bar(uⱼ)
 
-        Box filter: each LES cell averages fw^3 = 4096 DNS cells.
-        Reshape trick: [fw, 1024, 1024] → [fw, 64, fw, 64, fw] then
-        mean over axes (0, 2, 4) gives the filtered value at [64, 64].
-
-        Total download: 64 slabs × 200 MB ≈ 12.9 GB (cached after first run).
+        Download: 64 slabs × ~200 MB ≈ 12.9 GB total.
+        Peak RAM per slab: ~300 MB.
         """
         from givernylocal.turbulence_toolkit import getCutout
 
         cube   = self._get_cube()
         t_step = np.int32(time_idx + 1)
-        fw = self.FILTER_WIDTH    # 16
-        N  = self.DNS_N           # 1024
-        M  = self.LES_N           # 64
+        fw      = self.FILTER_WIDTH   # 16
+        N       = self.DNS_N          # 1024
+        M       = self.LES_N          # 64
+        n_slabs = N // fw             # 64
 
         PAIRS = [(0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 2)]
+        n_c, n_p = 3, len(PAIRS)
 
-        u_les    = np.zeros((M, M, M, 3),          dtype=np.float32)
-        bar_uiuj = np.zeros((M, M, M, len(PAIRS)), dtype=np.float64)
+        # Accumulators: store x,y-filtered slabs before z-filter
+        # Shape [n_slabs, fw, M, M, n_c/n_p]; reshape to [N, M, M, n_c/n_p] for z-filter
+        vel_inter  = np.zeros((n_slabs, fw, M, M, n_c), dtype=np.float32)
+        prod_inter = np.zeros((n_slabs, fw, M, M, n_p), dtype=np.float32)
 
-        for k in range(M):
-            z0 = k * fw + 1          # JHTDB 1-based index
+        for k in range(n_slabs):
+            z0 = k * fw + 1
             z1 = (k + 1) * fw
-
             axes = np.array(
-                [[1, N], [1, N], [z0, z1], [t_step, t_step]],
-                dtype=np.int32,
+                [[1, N], [1, N], [z0, z1], [t_step, t_step]], dtype=np.int32
             )
             strides = np.ones(4, dtype=np.int32)
 
-            print(f"\r  z-slab {k + 1:2d}/{M}  (DNS z={z0}–{z1}, "
-                  f"{(k + 1) / M * 100:.0f}% done)    ", end="", flush=True)
+            print(f"\r  z-slab {k + 1:2d}/{n_slabs}  "
+                  f"(DNS z={z0}–{z1}, {(k + 1) / n_slabs * 100:.0f}%)",
+                  end="", flush=True)
 
             res = getCutout(cube, 'velocity', axes, strides, verbose=False)
             vel = np.ascontiguousarray(
                 self._extract_velocity(res, int(t_step))   # [fw, N, N, 3]
             )
 
-            # Box filter via reshape: [fw, N, N] → [fw, M, fw, M, fw]
-            # averaging over the three within-cell axes (0, 2, 4)
-            vr = vel.reshape(fw, M, fw, M, fw, 3)
-            u_les[k] = vr.mean(axis=(0, 2, 4)).astype(np.float32)  # [M, M, 3]
+            for c in range(n_c):
+                vel_inter[k, ..., c] = self._gaussian_filter_xy(vel[..., c])
 
             for idx, (i, j) in enumerate(PAIRS):
                 uiuj = (vel[..., i].astype(np.float64)
-                        * vel[..., j].astype(np.float64))   # [fw, N, N]
-                bar_uiuj[k, :, :, idx] = (
-                    uiuj.reshape(fw, M, fw, M, fw).mean(axis=(0, 2, 4))
-                )
+                        * vel[..., j].astype(np.float64)).astype(np.float32)
+                prod_inter[k, ..., idx] = self._gaussian_filter_xy(uiuj)
+                del uiuj
 
-            del vel, vr
+            del vel
 
-        print("\n  Computing τᵢⱼ = bar(uᵢuⱼ) − bar(uᵢ)·bar(uⱼ) …")
+        print()
+
+        # Reshape [n_slabs, fw, M, M] → [N, M, M] and apply z-direction filter
+        print("  Applying z-direction Gaussian filter …")
+        vel_z  = vel_inter.reshape(N, M, M, n_c)
+        prod_z = prod_inter.reshape(N, M, M, n_p)
+        del vel_inter, prod_inter
+
+        u_les    = np.stack([self._gaussian_filter_z(vel_z[..., c])
+                             for c in range(n_c)], axis=-1)         # [M, M, M, 3]
+        bar_uiuj = np.stack([self._gaussian_filter_z(prod_z[..., idx])
+                             for idx in range(n_p)], axis=-1)       # [M, M, M, 6]
+        del vel_z, prod_z
+
+        print("  Computing τᵢⱼ = bar(uᵢuⱼ) − bar(uᵢ)·bar(uⱼ) …")
         tau = np.zeros((M, M, M, 3, 3), dtype=np.float32)
         for idx, (i, j) in enumerate(PAIRS):
-            t_ij = (bar_uiuj[..., idx]
+            t_ij = (bar_uiuj[..., idx].astype(np.float64)
                     - u_les[..., i].astype(np.float64)
-                    * u_les[..., j].astype(np.float64))
-            tau[..., i, j] = t_ij.astype(np.float32)
-            tau[..., j, i] = tau[..., i, j]
+                    * u_les[..., j].astype(np.float64)).astype(np.float32)
+            tau[..., i, j] = t_ij
+            tau[..., j, i] = t_ij
 
         return tau, u_les[..., 0], u_les[..., 1], u_les[..., 2]
+
+    def _gaussian_filter_xy(self, u_slab: np.ndarray) -> np.ndarray:
+        """
+        Apply 1D Gaussian LES filter and downsample along x then y.
+
+        G(k) = exp(−k² · (fw/2π)² / 24)  evaluated at wavenumbers k=0..N//2.
+        Truncates to |k| ≤ M//2 (LES Nyquist) and scales by M/N.
+
+        Input:  [fw, N, N] DNS slab (one component or product).
+        Output: [fw, M, M] Gaussian-filtered at LES (x, y) resolution.
+        """
+        fw, N, _ = u_slab.shape
+        M   = self.LES_N          # 64
+        km  = M // 2              # 32
+        sig = (self.FILTER_WIDTH / (2 * np.pi))**2 / 24.0
+        k   = np.fft.rfftfreq(N, d=1.0 / N).astype(np.float32)   # [N//2+1]
+        G   = np.exp(-k**2 * sig).astype(np.float32)
+
+        # Filter along x (axis 2): [fw, N, N] → [fw, N, M]
+        Ux    = np.fft.rfft(u_slab, axis=2)            # [fw, N, N//2+1]
+        Ux   *= G[np.newaxis, np.newaxis, :]
+        Ux_l  = Ux[:, :, :km + 1] * (M / N)           # truncate + scale
+        u_x   = np.fft.irfft(Ux_l, n=M, axis=2).astype(np.float32)  # [fw, N, M]
+        del Ux, Ux_l
+
+        # Filter along y (axis 1): [fw, N, M] → [fw, M, M]
+        Uy    = np.fft.rfft(u_x, axis=1)               # [fw, N//2+1, M]
+        Uy   *= G[:, np.newaxis]
+        Uy_l  = Uy[:, :km + 1, :] * (M / N)
+        u_xy  = np.fft.irfft(Uy_l, n=M, axis=1).astype(np.float32)  # [fw, M, M]
+        del Uy, Uy_l, u_x
+
+        return u_xy
+
+    def _gaussian_filter_z(self, u_z: np.ndarray) -> np.ndarray:
+        """
+        Apply 1D Gaussian LES filter and downsample along z.
+
+        Input:  [N, M, M] field at LES (x,y) but full DNS z-resolution.
+        Output: [M, M, M] fully filtered at LES resolution.
+        """
+        N   = self.DNS_N          # 1024
+        M   = self.LES_N          # 64
+        km  = M // 2              # 32
+        sig = (self.FILTER_WIDTH / (2 * np.pi))**2 / 24.0
+        k   = np.fft.rfftfreq(N, d=1.0 / N).astype(np.float32)
+        G   = np.exp(-k**2 * sig).astype(np.float32)
+
+        Uz   = np.fft.rfft(u_z, axis=0)                # [N//2+1, M, M]
+        Uz  *= G[:, np.newaxis, np.newaxis]
+        Uz_l = Uz[:km + 1, :, :] * (M / N)
+        u_out = np.fft.irfft(Uz_l, n=M, axis=0).astype(np.float32)  # [M, M, M]
+        del Uz, Uz_l
+
+        return u_out
 
 
 # ------------------------------------------------------------------
