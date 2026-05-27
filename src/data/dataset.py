@@ -22,118 +22,66 @@ from typing import Optional
 
 
 # ------------------------------------------------------------------
+# Precomputed change-of-basis matrices (e3nn convention)
+# These map Cartesian 3x3 tensors to e3nn irreducible representations,
+# guaranteed to transform under the Wigner D-matrices used internally
+# by the equivariant EGNN.
+#
+# Velocity gradient (general rank-2): 1x0e + 1x1e + 1x2e  (9 components)
+# SGS stress (symmetric rank-2):      1x0e + 1x2e          (6 components)
+# ------------------------------------------------------------------
+
+def _build_change_of_basis():
+    from e3nn.o3 import ReducedTensorProducts
+    rtp_grad   = ReducedTensorProducts('ij',    i='1o', j='1o')
+    rtp_stress = ReducedTensorProducts('ij=ji', i='1o', j='1o')
+    # Q_GRAD:   [9, 3, 3]  — x[k] = einsum('kij,ij', Q_GRAD, G)
+    # Q_STRESS: [6, 3, 3]  — x[k] = einsum('kij,ij', Q_STRESS, tau)
+    return (rtp_grad.change_of_basis.detach().float(),
+            rtp_stress.change_of_basis.detach().float())
+
+_Q_GRAD, _Q_STRESS = _build_change_of_basis()
+
+
+# ------------------------------------------------------------------
 # Irreps helpers: convert 3x3 tensors to irreps vectors and back
 # ------------------------------------------------------------------
 
 def grad_to_irreps(grad_u: torch.Tensor) -> torch.Tensor:
     """
-    Decompose velocity gradient [..., 3, 3] into SE(3) irreducible representations.
+    Decompose velocity gradient [..., 3, 3] into e3nn irreducible representations.
 
-    Decomposition:
-      l=0 (0e): trace / sqrt(3)                                     → 1 component
-      l=1 (1o): antisymmetric part (vorticity dual) / sqrt(2)       → 3 components
-      l=2 (2e): symmetric traceless part (spherical-harmonic basis)  → 5 components
-    Total: 9 components, matching the 9 entries of a 3×3 matrix.
+    Uses the e3nn-canonical basis (1x0e + 1x1e + 1x2e) so that the resulting
+    9-vector transforms correctly under Wigner D-matrices for any SO(3) rotation.
 
-    Returns [..., 9] irreps vector in order [l0, l1x, l1y, l1z, l2_0..4].
+    Returns [..., 9] irreps vector.
     """
-    # Symmetric and antisymmetric parts
-    S = 0.5 * (grad_u + grad_u.transpose(-1, -2))   # symmetric
-    A = 0.5 * (grad_u - grad_u.transpose(-1, -2))   # antisymmetric
-
-    # l=0: trace
-    tr = (S[..., 0, 0] + S[..., 1, 1] + S[..., 2, 2]) / np.sqrt(3)  # [..., 1]
-
-    # Symmetric traceless part
-    trace_val = S[..., 0, 0] + S[..., 1, 1] + S[..., 2, 2]
-    I = torch.eye(3, device=grad_u.device, dtype=grad_u.dtype)
-    S_tl = S - (trace_val / 3.0).unsqueeze(-1).unsqueeze(-1) * I
-
-    # l=2 basis (real solid harmonics, rank-2):
-    # Y_{2,-2} ~ xy, Y_{2,-1} ~ yz, Y_{2,0} ~ (2zz-xx-yy)/2, Y_{2,1} ~ xz, Y_{2,2} ~ (xx-yy)/2
-    l2 = torch.stack([
-        S_tl[..., 0, 1],                                             # xy
-        S_tl[..., 1, 2],                                             # yz
-        (2*S_tl[..., 2, 2] - S_tl[..., 0, 0] - S_tl[..., 1, 1]) / np.sqrt(12),
-        S_tl[..., 0, 2],                                             # xz
-        (S_tl[..., 0, 0] - S_tl[..., 1, 1]) / 2.0,                 # (xx-yy)
-    ], dim=-1)  # [..., 5]
-
-    # l=1: dual of antisymmetric part (vorticity / 2)
-    l1 = torch.stack([
-        A[..., 2, 1],   # omega_x / 2
-        A[..., 0, 2],   # omega_y / 2
-        A[..., 1, 0],   # omega_z / 2
-    ], dim=-1)  # [..., 3]
-
-    return torch.cat([tr.unsqueeze(-1), l1, l2], dim=-1)  # [..., 9]
+    Q = _Q_GRAD.to(grad_u.device)
+    return torch.einsum('kij,...ij->...k', Q, grad_u)
 
 
 def stress_to_irreps(tau: torch.Tensor) -> torch.Tensor:
     """
-    Decompose symmetric SGS stress [..., 3, 3] into irreps.
-
-    l=0 (0e): trace / sqrt(3)          → 1 component
-    l=2 (2e): symmetric traceless       → 5 components
-    Total: 6 components.
+    Decompose symmetric SGS stress [..., 3, 3] into e3nn irreps (1x0e + 1x2e).
 
     Returns [..., 6] irreps vector.
     """
-    tr = (tau[..., 0, 0] + tau[..., 1, 1] + tau[..., 2, 2]) / np.sqrt(3)
-
-    trace_val = tau[..., 0, 0] + tau[..., 1, 1] + tau[..., 2, 2]
-    I = torch.eye(3, device=tau.device, dtype=tau.dtype)
-    tau_tl = tau - (trace_val / 3.0).unsqueeze(-1).unsqueeze(-1) * I
-
-    l2 = torch.stack([
-        tau_tl[..., 0, 1],
-        tau_tl[..., 1, 2],
-        (2*tau_tl[..., 2, 2] - tau_tl[..., 0, 0] - tau_tl[..., 1, 1]) / np.sqrt(12),
-        tau_tl[..., 0, 2],
-        (tau_tl[..., 0, 0] - tau_tl[..., 1, 1]) / 2.0,
-    ], dim=-1)
-
-    return torch.cat([tr.unsqueeze(-1), l2], dim=-1)  # [..., 6]
+    Q = _Q_STRESS.to(tau.device)
+    return torch.einsum('kij,...ij->...k', Q, tau)
 
 
 def irreps_to_stress(x: torch.Tensor) -> torch.Tensor:
     """
-    Reconstruct symmetric 3x3 stress tensor from 6-component irreps vector.
+    Reconstruct symmetric 3x3 stress tensor from 6-component e3nn irreps vector.
 
     Args:
-        x: [..., 6]  [l0, l2_xy, l2_yz, l2_m0, l2_xz, l2_xx_yy]
+        x: [..., 6]
 
     Returns:
         tau: [..., 3, 3] symmetric tensor.
     """
-    tr_scaled = x[..., 0]
-    tr = tr_scaled * np.sqrt(3)
-
-    l2_xy  = x[..., 1]
-    l2_yz  = x[..., 2]
-    l2_m0  = x[..., 3]   # (2zz - xx - yy) / sqrt(12)
-    l2_xz  = x[..., 4]
-    l2_diag = x[..., 5]  # (xx - yy) / 2
-
-    # Recover diagonal elements
-    # m0 = (2*zz - xx - yy) / sqrt(12), diag = (xx-yy)/2
-    # tr = xx + yy + zz
-    # => zz = sqrt(12)*m0/3 + tr/3
-    # => xx = tr/3 + diag - sqrt(12)*m0/6
-    # => yy = tr/3 - diag - sqrt(12)*m0/6
-    sqrt12 = np.sqrt(12)
-    zz = sqrt12 * l2_m0 / 3 + tr / 3
-    xx = tr / 3 + l2_diag - sqrt12 * l2_m0 / 6
-    yy = tr / 3 - l2_diag - sqrt12 * l2_m0 / 6
-
-    tau = torch.zeros(*x.shape[:-1], 3, 3, device=x.device, dtype=x.dtype)
-    tau[..., 0, 0] = xx
-    tau[..., 1, 1] = yy
-    tau[..., 2, 2] = zz
-    tau[..., 0, 1] = tau[..., 1, 0] = l2_xy
-    tau[..., 1, 2] = tau[..., 2, 1] = l2_yz
-    tau[..., 0, 2] = tau[..., 2, 0] = l2_xz
-    return tau
+    Q = _Q_STRESS.to(x.device)
+    return torch.einsum('kij,...k->...ij', Q, x)
 
 
 # ------------------------------------------------------------------

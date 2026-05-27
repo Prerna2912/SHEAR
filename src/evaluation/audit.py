@@ -104,15 +104,17 @@ def equivariance_error_v1(
     def _forward(d: Data) -> torch.Tensor:
         d = d.to(device)
         batch = Batch.from_data_list([d])
+        # Always compute x from grad_full so original and rotated graphs
+        # both use unnormalized irreps — avoids normalization inconsistency.
+        x_raw = grad_to_irreps(batch.grad_full.reshape(-1, 3, 3))
         if isinstance(model, EGNNFlowMatching):
-            # Use fixed t=0.5, x_t = zeros for deterministic comparison
-            n = batch.x.shape[0]
+            n = x_raw.shape[0]
             x_t = torch.zeros(n, 6, device=device)
             t = torch.full((n, 1), 0.5, device=device)
-            return model.vf(x=batch.x, pos=batch.pos,
+            return model.vf(x=x_raw, pos=batch.pos,
                              edge_index=batch.edge_index, x_t=x_t, t=t)
         elif isinstance(model, SE3EquivariantEGNN):
-            return model(x=batch.x, pos=batch.pos, edge_index=batch.edge_index)
+            return model(x=x_raw, pos=batch.pos, edge_index=batch.edge_index)
         else:
             raise TypeError
 

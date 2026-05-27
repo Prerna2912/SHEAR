@@ -16,7 +16,7 @@ training:
   val_every: 500
   log_every: 100
   grad_clip: 1.0
-  batch_size: 256   # larger batch for MLP (much faster per step)
+  batch_size: 32
 
 data:
   n_train: 4000
