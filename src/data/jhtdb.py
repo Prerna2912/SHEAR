@@ -231,34 +231,30 @@ class JHTDBLoader:
 
     def prepare_les_data(self, time_idx: int = 0) -> tuple:
         """
-        Download 64^3 LES velocities and compute SGS stress + velocity gradient.
+        Download the full 1024^3 DNS velocity and compute the TRUE Leonard SGS stress:
+            τᵢⱼ = bar(uᵢ·uⱼ) − bar(uᵢ)·bar(uⱼ)
+        using a box filter of width filter_width=16 DNS cells per LES cell.
 
-        SGS stress is approximated via dynamic Smagorinsky on the filtered field.
-        Results are cached to jhtdb_cache/les_t{idx}.h5.
+        Downloads in 64 z-slabs (~200 MB each, ~12.9 GB total) to stay within
+        memory limits. Requires an authorised JHTDB token for large cutouts.
+        Results are cached to HDF5 after the first call.
 
         Returns:
-            tau:    [64, 64, 64, 3, 3] SGS stress.
+            tau:    [64, 64, 64, 3, 3] true SGS stress.
             grad_u: [64, 64, 64, 3, 3] filtered velocity gradient.
         """
         cache = self._cache_path(time_idx)
         if cache.exists():
             with h5py.File(cache, 'r') as f:
-                if 'tau' in f and 'grad_u' in f:
+                if ('tau' in f and 'grad_u' in f
+                        and f.attrs.get('filter_type') == 'box_leonard'):
                     print(f"Loaded from cache: {cache}")
                     return f['tau'][:], f['grad_u'][:]
+            print("Stale cache detected (old Smagorinsky approximation) — "
+                  "recomputing with true Leonard stress.")
 
-        u, v, w = self.load_les_velocities(time_idx)
-
-        dx = self.DX_LES
-        grad_u = compute_velocity_gradient(u, v, w, dx)
-
-        # Dynamic Smagorinsky SGS stress on the filtered field
-        vels = np.stack([u, v, w], axis=-1)
-        S = 0.5 * (grad_u + grad_u.transpose(0, 1, 2, 4, 3))
-        Smag = np.sqrt(2.0 * np.sum(S ** 2, axis=(-2, -1)))
-        Cs = 0.17
-        tau = (-2.0 * (Cs * dx) ** 2
-               * Smag[..., np.newaxis, np.newaxis] * S).astype(np.float32)
+        tau, u, v, w = self._compute_leonard_stress_chunked(time_idx)
+        grad_u = compute_velocity_gradient(u, v, w, self.DX_LES)
 
         with h5py.File(cache, 'w') as f:
             f.create_dataset('u_les',  data=u,      compression='gzip')
@@ -269,9 +265,80 @@ class JHTDBLoader:
             f.attrs['time_idx']     = time_idx
             f.attrs['filter_width'] = self.FILTER_WIDTH
             f.attrs['les_n']        = self.LES_N
+            f.attrs['filter_type']  = 'box_leonard'
 
         print(f"Saved LES cache → {cache}")
         return tau, grad_u
+
+    def _compute_leonard_stress_chunked(self, time_idx: int) -> tuple:
+        """
+        Download the 1024^3 DNS velocity one z-slab at a time and compute
+        the true Leonard SGS stress with a box filter.
+
+        For each LES z-slice k, downloads DNS z ∈ [k·fw, (k+1)·fw) at full
+        x-y resolution (slab shape: [fw, 1024, 1024, 3] ≈ 200 MB).
+
+        Box filter: each LES cell averages fw^3 = 4096 DNS cells.
+        Reshape trick: [fw, 1024, 1024] → [fw, 64, fw, 64, fw] then
+        mean over axes (0, 2, 4) gives the filtered value at [64, 64].
+
+        Total download: 64 slabs × 200 MB ≈ 12.9 GB (cached after first run).
+        """
+        from givernylocal.turbulence_toolkit import getCutout
+
+        cube   = self._get_cube()
+        t_step = np.int32(time_idx + 1)
+        fw = self.FILTER_WIDTH    # 16
+        N  = self.DNS_N           # 1024
+        M  = self.LES_N           # 64
+
+        PAIRS = [(0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 2)]
+
+        u_les    = np.zeros((M, M, M, 3),          dtype=np.float32)
+        bar_uiuj = np.zeros((M, M, M, len(PAIRS)), dtype=np.float64)
+
+        for k in range(M):
+            z0 = k * fw + 1          # JHTDB 1-based index
+            z1 = (k + 1) * fw
+
+            axes = np.array(
+                [[1, N], [1, N], [z0, z1], [t_step, t_step]],
+                dtype=np.int32,
+            )
+            strides = np.ones(4, dtype=np.int32)
+
+            print(f"\r  z-slab {k + 1:2d}/{M}  (DNS z={z0}–{z1}, "
+                  f"{(k + 1) / M * 100:.0f}% done)    ", end="", flush=True)
+
+            res = getCutout(cube, 'velocity', axes, strides, verbose=False)
+            vel = np.ascontiguousarray(
+                self._extract_velocity(res, int(t_step))   # [fw, N, N, 3]
+            )
+
+            # Box filter via reshape: [fw, N, N] → [fw, M, fw, M, fw]
+            # averaging over the three within-cell axes (0, 2, 4)
+            vr = vel.reshape(fw, M, fw, M, fw, 3)
+            u_les[k] = vr.mean(axis=(0, 2, 4)).astype(np.float32)  # [M, M, 3]
+
+            for idx, (i, j) in enumerate(PAIRS):
+                uiuj = (vel[..., i].astype(np.float64)
+                        * vel[..., j].astype(np.float64))   # [fw, N, N]
+                bar_uiuj[k, :, :, idx] = (
+                    uiuj.reshape(fw, M, fw, M, fw).mean(axis=(0, 2, 4))
+                )
+
+            del vel, vr
+
+        print("\n  Computing τᵢⱼ = bar(uᵢuⱼ) − bar(uᵢ)·bar(uⱼ) …")
+        tau = np.zeros((M, M, M, 3, 3), dtype=np.float32)
+        for idx, (i, j) in enumerate(PAIRS):
+            t_ij = (bar_uiuj[..., idx]
+                    - u_les[..., i].astype(np.float64)
+                    * u_les[..., j].astype(np.float64))
+            tau[..., i, j] = t_ij.astype(np.float32)
+            tau[..., j, i] = tau[..., i, j]
+
+        return tau, u_les[..., 0], u_les[..., 1], u_les[..., 2]
 
 
 # ------------------------------------------------------------------
