@@ -59,6 +59,7 @@ class Trainer:
         cfg: Optional[dict] = None,
         device: torch.device = torch.device('cpu'),
         out_dir: str = './runs',
+        stats: Optional[dict] = None,
     ):
         self.model = model.to(device)
         self.variant = variant.lower()
@@ -67,6 +68,7 @@ class Trainer:
         self.device = device
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.stats = stats  # used by V3 to normalise rotated targets
 
         hparams = {**self.DEFAULTS, **(cfg or {})}
         self.total_steps = hparams['total_steps']
@@ -116,17 +118,14 @@ class Trainer:
 
     def _prepare_batch_v3(self, batch: Batch):
         """
-        Flatten graph into per-node tensors and apply a random cubic rotation.
+        Flatten graph into per-node tensors, apply a random cubic rotation,
+        then normalise to match the stats used by V1/V2 (batch.x / batch.y).
         """
         batch = batch.to(self.device)
 
-        # Reconstruct 3x3 tensors from irreps storage
-        # .grad_full [N, 9], .tau_full [N, 9]
-        grad_flat = batch.grad_full   # [N, 9]  (flat 3x3, not irreps)
-        tau_full  = batch.tau_full    # [N, 9]
-
-        grad3x3 = grad_flat.reshape(-1, 3, 3)
-        tau3x3  = tau_full.reshape(-1, 3, 3)
+        # Reconstruct raw 3x3 tensors (tau_full / grad_full are unnormalised)
+        grad3x3 = batch.grad_full.reshape(-1, 3, 3)
+        tau3x3  = batch.tau_full.reshape(-1, 3, 3)
 
         # Random rotation from the 24 cubic group
         idx = torch.randint(0, 24, (1,)).item()
@@ -135,10 +134,19 @@ class Trainer:
         grad3x3 = R @ grad3x3 @ R.T     # [N, 3, 3]
         tau3x3  = R @ tau3x3  @ R.T     # [N, 3, 3]
 
-        # Convert to irreps for the MLP
         from data.dataset import grad_to_irreps, stress_to_irreps
         grad_irr = grad_to_irreps(grad3x3)    # [N, 9]
         tau_irr  = stress_to_irreps(tau3x3)   # [N, 6]
+
+        # Normalise to the same scale as batch.x / batch.y so that V3 trains
+        # on standardised targets, consistent with V1 and V2.
+        if self.stats is not None:
+            x_mean = self.stats['x_mean'].to(self.device)
+            x_std  = self.stats['x_std'].to(self.device)
+            y_mean = self.stats['y_mean'].to(self.device)
+            y_std  = self.stats['y_std'].to(self.device)
+            grad_irr = (grad_irr - x_mean) / x_std
+            tau_irr  = (tau_irr  - y_mean) / y_std
 
         return grad_irr, tau_irr
 

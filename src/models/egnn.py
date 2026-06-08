@@ -26,7 +26,6 @@ from torch.utils.checkpoint import checkpoint as grad_ckpt
 from e3nn import o3
 from e3nn.nn import BatchNorm as E3BatchNorm
 from torch_geometric.nn import MessagePassing
-from torch_geometric.utils import scatter
 
 
 # Irreps used throughout.
