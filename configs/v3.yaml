@@ -17,7 +17,7 @@ training:
   log_every: 100
   grad_clip: 1.0
   batch_size: 1
-  accumulation_steps: 32  # effective batch = 32
+  accumulation_steps: 8   # effective batch = 8 (32 too slow on T4; use 32 on A100)
 
 data:
   n_train: 4000

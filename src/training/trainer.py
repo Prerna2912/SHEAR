@@ -16,6 +16,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from torch.cuda.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch_geometric.data import Batch
@@ -90,6 +91,10 @@ class Trainer:
         self.global_step = 0
         self.best_val_loss = float('inf')
         self.history = {'train_loss': [], 'val_loss': [], 'lr': []}
+
+        # Mixed precision: enabled on CUDA, disabled on CPU
+        self.use_amp = device.type == 'cuda'
+        self.scaler = GradScaler(enabled=self.use_amp)
 
         # V3: precompute rotation matrices on device
         if self.variant == 'v3':
@@ -173,12 +178,15 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         total_loss = 0.0
         for batch in batches:
-            loss = self._forward_loss(batch) / self.accumulation_steps
-            loss.backward()
+            with autocast(enabled=self.use_amp):
+                loss = self._forward_loss(batch) / self.accumulation_steps
+            self.scaler.scale(loss).backward()
             total_loss += loss.item()
+        self.scaler.unscale_(self.optimizer)
         nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
         self._apply_warmup()
-        self.optimizer.step()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
         self.scheduler.step()
         return total_loss
 
@@ -272,6 +280,7 @@ class Trainer:
             'model_state': self.model.state_dict(),
             'optimizer_state': self.optimizer.state_dict(),
             'scheduler_state': self.scheduler.state_dict(),
+            'scaler_state': self.scaler.state_dict(),
             'val_loss': self.best_val_loss,
             'variant': self.variant,
         }
@@ -282,6 +291,8 @@ class Trainer:
         self.model.load_state_dict(ckpt['model_state'])
         self.optimizer.load_state_dict(ckpt['optimizer_state'])
         self.scheduler.load_state_dict(ckpt['scheduler_state'])
+        if 'scaler_state' in ckpt:
+            self.scaler.load_state_dict(ckpt['scaler_state'])
         self.global_step = ckpt['step']
         self.best_val_loss = ckpt.get('val_loss', float('inf'))
         print(f"Loaded checkpoint from step {self.global_step}")
