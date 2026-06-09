@@ -16,7 +16,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch_geometric.data import Batch
@@ -94,7 +94,7 @@ class Trainer:
 
         # Mixed precision: enabled on CUDA, disabled on CPU
         self.use_amp = device.type == 'cuda'
-        self.scaler = GradScaler(enabled=self.use_amp)
+        self.scaler = GradScaler('cuda', enabled=self.use_amp)
 
         # V3: precompute rotation matrices on device
         if self.variant == 'v3':
@@ -178,7 +178,7 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         total_loss = 0.0
         for batch in batches:
-            with autocast(enabled=self.use_amp):
+            with autocast('cuda', enabled=self.use_amp):
                 loss = self._forward_loss(batch) / self.accumulation_steps
             self.scaler.scale(loss).backward()
             total_loss += loss.item()
