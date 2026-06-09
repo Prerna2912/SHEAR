@@ -47,6 +47,7 @@ def rotate_graph(data: Data, R: torch.Tensor) -> Data:
         New Data object with all tensors rotated.
     """
     # Rotate positions
+    R = R.to(data.pos.device)
     new_pos = data.pos @ R.T    # [N, 3]
 
     # Rotate velocity gradient: G' = R G R^T
