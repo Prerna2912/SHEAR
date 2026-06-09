@@ -402,8 +402,8 @@ def backscatter_fraction(
     Returns:
         Scalar fraction in [0, 1].
     """
-    Pi = sgs_dissipation(pred_3x3, grad_3x3)   # [N]
-    return float((Pi > 0).float().mean().item())
+    Pi = sgs_dissipation(pred_3x3, grad_3x3)   # [N]; positive = forward scatter
+    return float((Pi < 0).float().mean().item())
 
 
 # ------------------------------------------------------------------
