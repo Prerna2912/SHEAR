@@ -69,6 +69,68 @@ class ExplorerRequest(BaseModel):
     )
 
 
+class ExplorerJobRequest(BaseModel):
+    """CF5 parametric explorer — backend auto-computes all perturbations."""
+    geometry_type: str
+    params: Dict[str, Any]
+    n_samples: int = Field(default=10, ge=5, le=50,
+                           description="Samples per inference call (fewer = faster).")
+    grid_size: int = Field(default=16, ge=4, le=32)
+
+
+class CF4Request(BaseModel):
+    """Request CF4 diagnostics for an already-computed inference result."""
+    mean_tau: List[List[float]]       # [N, 6]
+    variance_tau: List[List[float]]   # [N, 6]
+    grad_u: List[List[float]]         # [N, 9]
+
+
+class CF4Result(BaseModel):
+    """CF4 diagnostics result."""
+    q_values: List[float]           # [N] Q-criterion
+    regime_labels: List[int]        # [N] 0=strain-dom, 1=mixed, 2=vortex-dom
+    regime_thresholds: List[float]  # [p33, p66]
+    uncertainty: List[float]        # [N] L2 norm of variance_tau
+    high_unc_mask: List[bool]       # [N] top-25% uncertainty
+    dissipation: List[float]        # [N] Π = -τ:S
+    backscatter_mask: List[bool]    # [N] Π < 0
+    backscatter_frac: float
+
+
+class PerturbationPoint(BaseModel):
+    level: float
+    param: str
+    new_value: float
+    delta_peak_tau: float
+    peak_tau: float
+
+
+class ParameterRanking(BaseModel):
+    param: str
+    base_value: float
+    max_abs_delta: float
+    perturbations: List[PerturbationPoint]
+
+
+class InteractionMap(BaseModel):
+    param_a: str
+    param_b: str
+    base_value_a: float
+    base_value_b: float
+    levels: List[float]
+    grid: List[List[float]]
+
+
+class ExplorerResult(BaseModel):
+    geometry_type: str
+    base_params: Dict[str, Any]
+    base_peak_tau: float
+    parameter_ranking: List[ParameterRanking]
+    interaction_map: Optional[InteractionMap] = None
+    n_inference_calls: int
+    total_time_ms: int
+
+
 # ---------------------------------------------------------------------------
 # Job / progress models
 # ---------------------------------------------------------------------------

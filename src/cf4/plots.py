@@ -61,10 +61,20 @@ def make_figure(
         for spine in ax.spines.values():
             spine.set_edgecolor('#444')
 
+    stress_available = not np.allclose(cf4.dissipation, 0, atol=1e-10)
+
     _panel_regime(axes[0, 0], cf4, grid_shape)
-    _panel_uncertainty(axes[0, 1], cf4, grid_shape)
-    _panel_dissipation(axes[1, 0], cf4, grid_shape)
-    _panel_backscatter(axes[1, 1], cf4, grid_shape)
+    if stress_available:
+        _panel_uncertainty(axes[0, 1], cf4, grid_shape)
+        _panel_dissipation(axes[1, 0], cf4, grid_shape)
+        _panel_backscatter(axes[1, 1], cf4, grid_shape)
+    else:
+        for ax, title in [
+            (axes[0, 1], 'Prediction Uncertainty'),
+            (axes[1, 0], 'SGS Dissipation  Π = −τ:S'),
+            (axes[1, 1], 'Backscatter Map'),
+        ]:
+            _panel_placeholder(ax, title)
 
     # Title
     subtitle = ""
@@ -84,6 +94,35 @@ def make_figure(
 # ---------------------------------------------------------------------------
 # Individual panels
 # ---------------------------------------------------------------------------
+
+def _panel_placeholder(ax, title: str):
+    """Render a clean placeholder for stress-dependent panels when no V1 inference has run."""
+    ax.set_facecolor('#16181C')
+    for spine in ax.spines.values():
+        spine.set_edgecolor('#252830')
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title(title, color='#8B8D92', fontsize=10, pad=8)
+
+    # Dashed border rectangle
+    from matplotlib.patches import FancyBboxPatch
+    ax.add_patch(FancyBboxPatch(
+        (0.1, 0.25), 0.8, 0.5,
+        boxstyle='round,pad=0.02',
+        linewidth=1, linestyle='--',
+        edgecolor='#252830', facecolor='none',
+        transform=ax.transAxes, clip_on=False,
+    ))
+
+    ax.text(0.5, 0.52, 'V1 inference required',
+            transform=ax.transAxes, ha='center', va='center',
+            color='#E8E8E6', fontsize=10, fontweight='500')
+    ax.text(0.5, 0.40, 'Uncheck  Quick mode  and click Run',
+            transform=ax.transAxes, ha='center', va='center',
+            color='#4A9B8E', fontsize=8)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+
 
 def _panel_regime(ax, cf4: CF4Output, grid_shape):
     """Panel 0: Flow regime map (Q-criterion coloured)."""

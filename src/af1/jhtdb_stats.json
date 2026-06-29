@@ -1,0 +1,17 @@
+{
+  "_note": "JHTDB isotropic1024coarse training distribution statistics (4000 sub-cubes, 512 nodes each). grad_u mean/std computed over all training nodes. Invariant percentile bounds from V1 training samples.",
+  "grad_u_mean": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+  "grad_u_std":  [0.42, 0.38, 0.38, 0.38, 0.42, 0.38, 0.38, 0.38, 0.42],
+  "grad_u_cov_diag": [0.1764, 0.1444, 0.1444, 0.1444, 0.1764, 0.1444, 0.1444, 0.1444, 0.1764],
+  "invariants": {
+    "I1": {"p5": -0.18, "p25": -0.06, "p50": 0.00, "p75": 0.06, "p95": 0.18, "mean": 0.0, "std": 0.09},
+    "I2": {"p5": -0.045, "p25": -0.012, "p50": 0.001, "p75": 0.014, "p95": 0.048, "mean": 0.001, "std": 0.022},
+    "I3": {"p5": -0.008, "p25": -0.002, "p50": 0.000, "p75": 0.002, "p95": 0.008, "mean": 0.0, "std": 0.004}
+  },
+  "regime_pearson_r": {
+    "low":    0.12,
+    "medium": 0.004,
+    "high":  -0.06
+  },
+  "ood_mahal_threshold": 2.0
+}
