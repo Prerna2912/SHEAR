@@ -1,261 +1,240 @@
-"""
-SHEAR CF4 — Gradio demo app.
-
-Runs the full pipeline:
-  CF1 (panel method → ∇u graph)
-  → CF2 (V1 ODE → mean τ, variance)
-  → CF4 (Q-criterion, uncertainty, dissipation, backscatter)
-  → 4-panel diagnostic figure
-
-Run locally:
-    python demos/cf4_demo.py
-
-HuggingFace Spaces:
-    The entrypoint is `demo.launch(server_name="0.0.0.0", server_port=7860)`.
-    Set V1_CHECKPOINT and V1_STATS env vars, or defaults are used.
-"""
-
-import sys
-import os
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parents[1]))
-
-import gradio as gr
+import json
+import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import json
-import numpy as np
+import matplotlib.colors as mcolors
+from matplotlib.patches import Patch
+from pathlib import Path
 
-# Defaults
-CHECKPOINT = os.environ.get("V1_CHECKPOINT", "runs/quick/v1/last.pt")
-STATS_PATH = os.environ.get("V1_STATS",      "runs/quick/stats.pt")
-MOCK_FIXTURE = "tests/fixtures/mock_cf2_response.json"
+# load the mock response that prerona added
+fixture_path = Path(__file__).parent.parent / "tests" / "fixtures" / "mock_cf2_response.json"
+with open(fixture_path) as f:
+    result = json.load(f)
 
-# ---------------------------------------------------------------------------
-# Model singleton — loaded once at startup
-# ---------------------------------------------------------------------------
+# pull out what we need
+grad_u       = np.array(result["grad_u"],       dtype=np.float32)
+mean_tau     = np.array(result["mean_tau"],     dtype=np.float32)
+variance_tau = np.array(result["variance_tau"], dtype=np.float32)
+grid_shape   = result["grid_shape"]
+params       = result["params"]
+n_nodes      = result["n_nodes"]
+n_samples    = result["n_samples"]
 
-_model  = None
-_stats  = None
-_device = None
+print("grad_u shape :", grad_u.shape)
+print("mean_tau shape:", mean_tau.shape)
+print("grid_shape    :", grid_shape)
+print("n_nodes       :", n_nodes)
+print("geometry      :", result["geometry_type"])
 
-def _ensure_model():
-    global _model, _stats, _device
-    if _model is None:
-        from src.cf2.checkpoint import load_v1
-        _model, _stats, _device = load_v1(CHECKPOINT, STATS_PATH)
+# -----------------------------------------------------------------
+# Q-criterion
+# Q = 0.5 * (||Omega||^2 - ||S||^2)
+# positive Q means vortex dominated, negative means strain dominated
+# -----------------------------------------------------------------
 
+G  = grad_u.reshape(-1, 3, 3)
+S  = 0.5 * (G + G.transpose(0, 2, 1))
+Om = 0.5 * (G - G.transpose(0, 2, 1))
+Q  = 0.5 * ((Om * Om).sum(axis=(-2, -1)) - (S * S).sum(axis=(-2, -1)))
 
-# ---------------------------------------------------------------------------
-# Geometry parameter presets per type
-# ---------------------------------------------------------------------------
+# split into 3 regimes using 33rd and 66th percentile same as task 3
+p33 = float(np.percentile(Q, 33.3))
+p66 = float(np.percentile(Q, 66.7))
 
-GEOMETRY_DEFAULTS = {
-    "aerofoil": dict(
-        chord=1.0, span=5.0, alpha_deg=5.0, U_inf=50.0,
-        Re=3_000_000.0, naca_code="2412"
-    ),
-    "swept_wing": dict(
-        chord=2.0, span=12.0, alpha_deg=4.0, sweep_deg=30.0,
-        dihedral_deg=5.0, U_inf=80.0, Re=8_000_000.0, naca_code="2412"
-    ),
-    "bluff_body": dict(
-        length=1.0, height=0.5, U_inf=20.0, Re=50_000.0
-    ),
-    "cylinder": dict(
-        diameter=0.1, U_inf=10.0, Re=100.0
-    ),
-    "flat_plate": dict(
-        length=1.0, span=2.0, alpha_deg=3.0, U_inf=30.0, Re=500_000.0
-    ),
-    "turbine_blade": dict(
-        blade_radius=40.0, chord=2.5, pitch_deg=5.0,
-        rpm=12.0, V_axial=10.0, n_panels=60
-    ),
-    "ship_hull": dict(
-        length=100.0, beam=15.0, draft=5.0, U_inf=5.0, Re=1_000_000_000.0
-    ),
-    "bluff_body_wake": dict(
-        length=1.0, height=0.5, Cd=1.0, U_inf=20.0, Re=50_000.0
-    ),
-}
+regime = np.zeros(len(Q), dtype=np.int32)
+regime[Q >= p33] = 1
+regime[Q >= p66] = 2
 
+print(f"\nQ range: {Q.min():.3f} to {Q.max():.3f}")
+print(f"p33={p33:.4f}  p66={p66:.4f}")
+print(f"strain: {(regime==0).sum()}  mixed: {(regime==1).sum()}  vortex: {(regime==2).sum()}")
 
-# ---------------------------------------------------------------------------
-# Core inference function
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------
+# uncertainty - just take L2 norm of variance across 6 components
+# -----------------------------------------------------------------
 
-def run_pipeline(
-    geometry_type: str,
-    alpha_deg: float,
-    U_inf: float,
-    Re: float,
-    chord: float,
-    span: float,
-    n_samples: int,
-    use_mock: bool,
-) -> tuple:
-    """
-    Called by Gradio on every button click.
-    Returns (figure, status_text).
-    """
-    try:
-        if use_mock:
-            with open(MOCK_FIXTURE) as f:
-                result = json.load(f)
-            status = (
-                f"Mock fixture loaded ({result['n_nodes']} nodes). "
-                "Uncheck 'Use mock fixture' to run live inference."
-            )
-        else:
-            _ensure_model()
+unc = np.sqrt((variance_tau ** 2).sum(axis=-1))
+high_unc = unc >= np.percentile(unc, 75)
 
-            # Build params from UI inputs + defaults for non-shown params
-            base = dict(GEOMETRY_DEFAULTS.get(geometry_type, {}))
-            base.update({
-                "U_inf": float(U_inf),
-                "Re":    float(Re),
-            })
-            if "alpha_deg" in base:
-                base["alpha_deg"] = float(alpha_deg)
-            if "chord" in base:
-                base["chord"] = float(chord)
-            if "span" in base:
-                base["span"] = float(span)
+print(f"\nuncertainty mean={unc.mean():.4f}  max={unc.max():.4f}")
+print(f"high uncertainty nodes: {high_unc.sum()} out of {n_nodes}")
 
-            from src.cf2.inference import run_inference, geometry_hash
-            from src.cf1 import solve as cf1_solve
+# -----------------------------------------------------------------
+# SGS dissipation  Pi = - tau : S
+# need to expand mean_tau from voigt [N,6] to full [N,3,3]
+# voigt order assumed: xx yy zz xy xz yz
+# -----------------------------------------------------------------
 
-            cf1_out = cf1_solve(geometry_type, base, grid_size=8)
-            raw = run_inference(
-                graph=cf1_out.graph,
-                model=_model, stats=_stats, device=_device,
-                n_samples=int(n_samples), ode_steps=50,
-                include_samples=False,
-            )
+tau = np.zeros((n_nodes, 3, 3), dtype=np.float32)
+tau[:, 0, 0] = mean_tau[:, 0]
+tau[:, 1, 1] = mean_tau[:, 1]
+tau[:, 2, 2] = mean_tau[:, 2]
+tau[:, 0, 1] = mean_tau[:, 3]
+tau[:, 1, 0] = mean_tau[:, 3]
+tau[:, 0, 2] = mean_tau[:, 4]
+tau[:, 2, 0] = mean_tau[:, 4]
+tau[:, 1, 2] = mean_tau[:, 5]
+tau[:, 2, 1] = mean_tau[:, 5]
 
-            result = {
-                "mean_tau":     raw["mean_tau"].tolist(),
-                "variance_tau": raw["variance_tau"].tolist(),
-                "grad_u":       cf1_out.grad_u.reshape(-1, 9).tolist(),
-                "grid_shape":   list(cf1_out.grid_shape),
-                "geometry_type": geometry_type,
-                "params":        base,
-                "n_nodes":       raw["n_nodes"],
-                "inference_time_ms": 0,
-            }
-            status = (
-                f"Live inference complete — {result['n_nodes']} nodes, "
-                f"{n_samples} CFM samples"
-            )
+Pi = -(tau * S).sum(axis=(-2, -1))
 
-        from src.cf4 import diagnose
-        fig = diagnose(result, geometry_type=result["geometry_type"])
+backscatter = Pi < 0
+bs_frac     = float(backscatter.mean())
 
-        return fig, status
+print(f"\ndissipation range: {Pi.min():.4f} to {Pi.max():.4f}")
+print(f"backscatter fraction: {bs_frac:.1%}")
+print("note: smagorinsky always 0% backscatter by construction")
 
-    except Exception as e:
-        import traceback
-        return None, f"Error: {e}\n\n{traceback.format_exc()}"
+# -----------------------------------------------------------------
+# helper to get the mid z-slice for plotting
+# -----------------------------------------------------------------
+
+def get_slice(arr, gs):
+    nx, ny, nz = gs
+    return arr.reshape(nx, ny, nz)[:, :, nz // 2].T
 
 
-# ---------------------------------------------------------------------------
-# Gradio UI
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------
+# 4 panel plot
+# -----------------------------------------------------------------
 
-CSS = """
-body { background-color: #0f1117; color: #e0e0e0; }
-.gr-button-primary { background: #6366f1 !important; }
-.gr-box { background: #1a1d27 !important; border: 1px solid #333 !important; }
-footer { display: none !important; }
-"""
+RCOLS  = ["#4575b4", "#74add1", "#d73027"]
+RNAMES = ["Strain-dominated", "Mixed", "Vortex-dominated"]
 
-with gr.Blocks(title="SHEAR CF4 — Regime & Uncertainty Diagnostics") as demo:
+fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+fig.patch.set_facecolor("#0f1117")
 
-    gr.Markdown(
-        """
-        # SHEAR — CF4: Uncertainty & Regime Map
-        **SE(3)-Equivariant SGS Stress Inference** | Panel Method → V1 ODE → Diagnostics
+for ax in axes.flat:
+    ax.set_facecolor("#1a1d27")
+    for sp in ax.spines.values():
+        sp.set_edgecolor("#444")
 
-        Enter a geometry below and click **Run SHEAR** to see:
-        - Flow regime map (Q-criterion)
-        - Prediction uncertainty heatmap
-        - SGS dissipation field (Π = −τ:S)
-        - Backscatter map (energy back-transfer V1 captures, Smagorinsky cannot)
-        """
-    )
+# panel 0 - regime map
+ax = axes[0, 0]
+reg_sl = get_slice(regime.astype(np.float32), grid_shape)
+q_sl   = get_slice(Q, grid_shape)
 
-    with gr.Row():
-        with gr.Column(scale=1):
-            gr.Markdown("### Geometry")
+cmap_reg = mcolors.ListedColormap(RCOLS)
+ax.imshow(reg_sl, origin="lower", cmap=cmap_reg,
+          vmin=-0.5, vmax=2.5, aspect="auto", interpolation="nearest")
 
-            geometry_type = gr.Dropdown(
-                choices=list(GEOMETRY_DEFAULTS.keys()),
-                value="aerofoil",
-                label="Geometry type",
-            )
-            alpha_deg = gr.Slider(-20, 20, value=5.0, step=0.5,
-                                  label="Angle of attack α (deg)")
-            U_inf = gr.Slider(1, 200, value=50.0, step=1.0,
-                              label="Freestream velocity U∞ (m/s)")
-            Re = gr.Slider(1e3, 1e7, value=3e6, step=1e5,
-                           label="Reynolds number Re")
-            chord = gr.Slider(0.1, 10.0, value=1.0, step=0.1,
-                              label="Chord / length (m)")
-            span  = gr.Slider(0.5, 20.0, value=5.0, step=0.5,
-                              label="Span (m)")
+try:
+    ax.contour(q_sl, levels=5, colors="white", linewidths=0.5, alpha=0.35)
+except Exception:
+    pass
 
-            gr.Markdown("### Inference")
-            n_samples = gr.Slider(3, 20, value=5, step=1,
-                                  label="CFM samples (more = slower but better uncertainty)")
-            use_mock = gr.Checkbox(
-                value=True,
-                label="Use mock fixture (instant, no model needed)",
-            )
+legend_p = [Patch(color=RCOLS[i], label=RNAMES[i]) for i in range(3)]
+ax.legend(handles=legend_p, loc="upper right", fontsize=7,
+          framealpha=0.6, labelcolor="white", facecolor="#222")
 
-            run_btn = gr.Button("Run SHEAR", variant="primary")
+ax.set_title("Flow Regime Map  (Q-criterion)", color="white", fontsize=10, fontweight="bold")
+ax.set_xlabel("x streamwise", color="#aaa", fontsize=8)
+ax.set_ylabel("y normal", color="#aaa", fontsize=8)
+ax.tick_params(colors="#888", labelsize=7)
+ax.text(0.02, 0.04, f"thresholds  p33={p33:.2e}  p66={p66:.2e}",
+        transform=ax.transAxes, color="#aaa", fontsize=6.5)
 
-        with gr.Column(scale=2):
-            plot_out = gr.Plot(label="CF4 Diagnostic Panels")
-            status_out = gr.Textbox(label="Status", lines=2, interactive=False)
+for r, nm in enumerate(RNAMES):
+    cnt = (regime == r).sum()
+    ax.text(0.02, 0.17 - r * 0.08,
+            f"{nm}: {cnt} nodes ({cnt/n_nodes:.0%})",
+            transform=ax.transAxes, color=RCOLS[r], fontsize=6.5)
 
-    # Examples
-    gr.Examples(
-        examples=[
-            ["aerofoil",       5.0,  50.0, 3e6, 1.0, 5.0,  5, True],
-            ["swept_wing",     4.0,  80.0, 8e6, 2.0, 12.0, 5, True],
-            ["cylinder",       0.0,  10.0, 1e5, 0.1, 1.0,  5, True],
-            ["bluff_body_wake",0.0,  20.0, 5e4, 1.0, 2.0,  5, True],
-            ["turbine_blade",  0.0,  10.0, 1e6, 2.5, 40.0, 5, True],
-        ],
-        inputs=[geometry_type, alpha_deg, U_inf, Re, chord, span, n_samples, use_mock],
-        label="Quick examples",
-    )
+# panel 1 - uncertainty
+ax = axes[0, 1]
+unc_sl  = get_slice(unc, grid_shape)
+mask_sl = get_slice(high_unc.astype(np.float32), grid_shape)
 
-    run_btn.click(
-        fn=run_pipeline,
-        inputs=[geometry_type, alpha_deg, U_inf, Re, chord, span, n_samples, use_mock],
-        outputs=[plot_out, status_out],
-    )
+im1 = ax.imshow(unc_sl, origin="lower", cmap="plasma",
+                aspect="auto", interpolation="bilinear")
+cb1 = plt.colorbar(im1, ax=ax, fraction=0.046, pad=0.04)
+cb1.set_label("L2 norm of variance_tau", color="#aaa", fontsize=7)
+cb1.ax.tick_params(colors="#888", labelsize=6)
 
-    gr.Markdown(
-        """
-        ---
-        **Coordinate system:** x=streamwise, y=normal, z=spanwise. Mid-plane slice shown (z = Nz/2).
-        **Regimes:** Blue = strain-dominated (Q<p33), mid = mixed, Red = vortex-dominated (Q>p66).
-        **Backscatter:** Smagorinsky always predicts Π ≥ 0. V1 captures back-transfer to resolved scales.
-        """
-    )
+try:
+    ax.contour(mask_sl, levels=[0.5], colors=["#ff6b6b"], linewidths=1.4, linestyles="--")
+except Exception:
+    pass
 
+ax.set_title("Prediction Uncertainty  (V1 ensemble spread)", color="white",
+             fontsize=10, fontweight="bold")
+ax.set_xlabel("x streamwise", color="#aaa", fontsize=8)
+ax.set_ylabel("y normal", color="#aaa", fontsize=8)
+ax.tick_params(colors="#888", labelsize=7)
+ax.text(0.02, 0.08, "dashed red = top 25% uncertainty",
+        transform=ax.transAxes, color="#ff6b6b", fontsize=7)
+ax.text(0.02, 0.03, f"mean={unc.mean():.3f}  max={unc.max():.3f}",
+        transform=ax.transAxes, color="#aaa", fontsize=7)
 
-if __name__ == "__main__":
-    print(f"[CF4 demo] Checkpoint: {CHECKPOINT}")
-    print(f"[CF4 demo] Mock fixture: {MOCK_FIXTURE}")
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=int(os.environ.get("PORT", 7860)),
-        share=False,
-        css=CSS,
-    )
+# panel 2 - sgs dissipation
+ax = axes[1, 0]
+pi_sl   = get_slice(Pi, grid_shape)
+abs_max = max(np.abs(pi_sl).max(), 1e-10)
+
+im2 = ax.imshow(pi_sl, origin="lower", cmap="RdBu_r",
+                vmin=-abs_max, vmax=abs_max,
+                aspect="auto", interpolation="bilinear")
+cb2 = plt.colorbar(im2, ax=ax, fraction=0.046, pad=0.04)
+cb2.set_label("Pi = -tau:S   (forward < 0 < backscatter)", color="#aaa", fontsize=6.5)
+cb2.ax.tick_params(colors="#888", labelsize=6)
+
+try:
+    ax.contour(pi_sl, levels=[0], colors=["white"], linewidths=0.8)
+except Exception:
+    pass
+
+ax.set_title("SGS Dissipation  Pi = -tau:S", color="white", fontsize=10, fontweight="bold")
+ax.set_xlabel("x streamwise", color="#aaa", fontsize=8)
+ax.set_ylabel("y normal", color="#aaa", fontsize=8)
+ax.tick_params(colors="#888", labelsize=7)
+ax.text(0.02, 0.09, f"forward scatter: {(1-bs_frac):.1%}",
+        transform=ax.transAxes, color="#e8747c", fontsize=8, fontweight="bold")
+ax.text(0.02, 0.03, f"backscatter: {bs_frac:.1%}  (smagorinsky = 0% always)",
+        transform=ax.transAxes, color="#6baed6", fontsize=7)
+
+# panel 3 - backscatter map
+ax = axes[1, 1]
+bs_sl = get_slice(backscatter.astype(np.float32), grid_shape)
+
+cmap_bs = mcolors.ListedColormap(["#1a1d27", "#ff6b35"])
+ax.imshow(bs_sl, origin="lower", cmap=cmap_bs,
+          vmin=0, vmax=1, aspect="auto", interpolation="nearest")
+
+ax.set_title(f"Backscatter Map  (fraction = {bs_frac:.1%})",
+             color="white", fontsize=10, fontweight="bold")
+ax.set_xlabel("x streamwise", color="#aaa", fontsize=8)
+ax.set_ylabel("y normal", color="#aaa", fontsize=8)
+ax.tick_params(colors="#888", labelsize=7)
+
+leg_bs = [
+    Patch(color="#1a1d27", label="Forward  (Pi >= 0)"),
+    Patch(color="#ff6b35", label="Backscatter  (Pi < 0)"),
+]
+ax.legend(handles=leg_bs, loc="upper right", fontsize=7,
+          framealpha=0.7, labelcolor="white", facecolor="#222")
+
+for r, nm in enumerate(RNAMES):
+    mask_r = regime == r
+    fr = backscatter[mask_r].mean() if mask_r.any() else 0.0
+    ax.text(0.02, 0.22 - r * 0.07,
+            f"{nm[:9]}: {fr:.1%}",
+            transform=ax.transAxes, color=RCOLS[r], fontsize=7)
+
+ax.text(0.02, 0.03, "smagorinsky = no backscatter by construction",
+        transform=ax.transAxes, color="#888", fontsize=6.5, fontstyle="italic")
+
+# title
+param_str = "  ".join(f"{k}={v}" for k, v in list(params.items())[:3])
+fig.suptitle(
+    f"SHEAR  CF4 Diagnostics  —  {result['geometry_type']}  |  {param_str}\n"
+    f"{n_samples} V1 samples  |  {result['inference_time_ms']}ms",
+    fontsize=12, color="white", y=0.997, fontweight="bold"
+)
+
+fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+out = Path(__file__).parent.parent / "figures" / "cf4_aerofoil_demo.png"
+out.parent.mkdir(exist_ok=True)
+fig.savefig(out, dpi=150, bbox_inches="tight", facecolor="#0f1117")
+print(f"\nsaved to {out}")
