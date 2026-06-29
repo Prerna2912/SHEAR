@@ -112,7 +112,8 @@ async def submit_inference(request: GeometryRequest):
     ghash = geometry_hash(request.geometry_type, request.params)
 
     # Cache hit: return a synthetic job that is immediately complete
-    cache = get_cache()
+
+     cache = get_cache()
     cached = cache.get(ghash)
     if cached is not None:
         import uuid
