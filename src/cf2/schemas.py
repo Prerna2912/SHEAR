@@ -37,19 +37,23 @@ class GeometryRequest(BaseModel):
         description="Geometry-specific parameter dict (see CF1 validation docs).",
     )
     n_samples: int = Field(
-        default=20,
+        default=5,
         ge=5, le=50,
-        description="Number of CFM ODE samples (5–50). Default 20.",
+        description="Number of CFM ODE samples (5–50). Default 5 for demo speed.",
     )
     ode_steps: int = Field(
-        default=100,
-        ge=10, le=500,
-        description="ODE solver step budget (Dopri5 adaptive; this caps max steps).",
+        default=10,
+        ge=5, le=500,
+        description="ODE solver steps per sample. 10 euler steps ≈ <1s on CPU.",
     )
     grid_size: int = Field(
-        default=16,
+        default=8,
         ge=4, le=32,
-        description="CF1 grid resolution per side (4–32). Default 16 → 4096 nodes.",
+        description="CF1 grid resolution per side (4–32). Default 8 → 512 nodes.",
+    )
+    ode_method: str = Field(
+        default="euler",
+        description="ODE solver: 'euler' (fast, demo) or 'dopri5' (accurate, slow on CPU).",
     )
     include_samples: bool = Field(
         default=False,
@@ -73,9 +77,13 @@ class ExplorerJobRequest(BaseModel):
     """CF5 parametric explorer — backend auto-computes all perturbations."""
     geometry_type: str
     params: Dict[str, Any]
-    n_samples: int = Field(default=10, ge=5, le=50,
+    n_samples: int = Field(default=5, ge=5, le=50,
                            description="Samples per inference call (fewer = faster).")
-    grid_size: int = Field(default=16, ge=4, le=32)
+    grid_size: int = Field(default=4, ge=4, le=32)
+    ode_steps: int = Field(default=10, ge=5, le=200,
+                           description="ODE solver steps per call. Lower = faster, less accurate.")
+    ode_method: str = Field(default="euler",
+                            description="ODE method: 'euler' (fast) or 'dopri5' (accurate).")
 
 
 class CF4Request(BaseModel):

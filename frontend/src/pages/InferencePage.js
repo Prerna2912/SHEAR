@@ -4,7 +4,7 @@ import StressViewer from '../components/StressViewer';
 import CF4Panel from '../components/CF4Panel';
 import CF5Explorer from '../components/CF5Explorer';
 import AF1Panel from '../components/AF1Panel';
-import ProgressTracker from '../components/ProgressTracker';
+import { InferenceLoadingOverlay, ExplorerLoadingOverlay } from '../components/ProgressTracker';
 import CopilotPanel from '../components/CopilotPanel';
 import { submitInference, connectProgress, fetchCF4, runExplorer } from '../data/api';
 import { generateMockResult, generateMockExplorerResult } from '../data/mockFixture';
@@ -16,12 +16,12 @@ const MOCK_MODE = process.env.REACT_APP_MOCK_MODE === 'true' || !process.env.REA
 
 const TABS = [
   { id: 0, label: '3D Field',    icon: '◉' },
-  { id: 1, label: 'CF4',         icon: '⚡' },
-  { id: 2, label: 'AF1',         icon: '⬡' },
-  { id: 3, label: 'CF5 Explorer',icon: '≋' },
+  { id: 1, label: 'Diagnostics', icon: '⚡' },
+  { id: 2, label: 'Flow Regime', icon: '⬡' },
+  { id: 3, label: 'Sensitivity', icon: '≋' },
 ];
 
-export default function InferencePage({ onResult }) {
+export default function InferencePage({ onResult, gtype, formParams, onGtypeChange, onFormParamsChange }) {
   const [activeTab,      setActiveTab]      = useState(0);
   const [result,         setResult]         = useState(null);
   const [explorerResult, setExplorerResult] = useState(null);
@@ -32,8 +32,8 @@ export default function InferencePage({ onResult }) {
   const [progressError,  setProgressError]  = useState(null);
   const [saveStatus,     setSaveStatus]     = useState(null);
   const [copilotOpen,    setCopilotOpen]    = useState(false);
-  const [lastGtype,      setLastGtype]      = useState('aerofoil');
-  const [lastParams,     setLastParams]     = useState({});
+  const [lastGtype,      setLastGtype]      = useState(gtype || 'aerofoil');
+  const [lastParams,     setLastParams]     = useState(formParams || {});
   const wsRef = useRef(null);
 
   const clearProgress = useCallback(() => { setProgressMsgs([]); setProgress(0); setProgressError(null); }, []);
@@ -89,6 +89,7 @@ export default function InferencePage({ onResult }) {
     clearProgress();
     setIsExploring(true);
     setExplorerResult(null);
+    setActiveTab(3); // switch to Sensitivity tab immediately so overlay is visible
 
     if (MOCK_MODE) {
       setProgressMsgs([{ message: 'Running parametric sweep…' }]);
@@ -109,6 +110,8 @@ export default function InferencePage({ onResult }) {
     finally { setIsExploring(false); }
   }, [clearProgress]);
 
+  const cf4Live = result ? computeCF4(result.mean_tau, result.variance_tau, result.grad_u) : null;
+
   const handleSave = useCallback(async () => {
     if (!result) return;
     const name = window.prompt('Project name:', `${lastGtype} — ${new Date().toLocaleDateString()}`);
@@ -125,29 +128,54 @@ export default function InferencePage({ onResult }) {
   const handleDownloadReport = useCallback(async () => {
     if (!result) return;
     if (MOCK_MODE) { alert('PDF export requires the backend server.'); return; }
+
+    // Pre-compute per-node magnitudes so the backend can render charts
+    const tauMags = (result.mean_tau || []).map(
+      row => Math.sqrt(row.reduce((s, v) => s + v * v, 0))
+    );
+    const uncMags = (result.variance_tau || []).map(
+      row => Math.sqrt(row.reduce((s, v) => s + v * v, 0))
+    );
+    const peakTau   = tauMags.length ? Math.max(...tauMags) : 0;
+    const meanTauN  = tauMags.length ? tauMags.reduce((s, v) => s + v, 0) / tauMags.length : 0;
+    const meanUnc   = uncMags.length ? uncMags.reduce((s, v) => s + v, 0) / uncMags.length : 0;
+
+    const cf4 = result._cf4 || cf4Live;
+
+    const metrics = {
+      'Peak |τ| (SGS stress)':   peakTau,
+      'Mean |τ|':                meanTauN,
+      'Mean uncertainty σ':      meanUnc,
+      'Backscatter fraction':    cf4 ? cf4.backscatter_frac : 0,
+      'Grid nodes':              result.n_nodes,
+      'ODE samples':             result.n_samples,
+      'Inference time (ms)':     result.inference_time_ms,
+      'Grid size (per side)':    result.grid_shape ? result.grid_shape[0] : '—',
+    };
+
     const res = await fetch(`${API_BASE}/api/v1/report`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ geometry_type: lastGtype, params: lastParams, metrics: {}, cf4_data: {}, cf5_data: explorerResult || {} }),
+      body: JSON.stringify({
+        geometry_type:      lastGtype,
+        params:             lastParams,
+        metrics,
+        cf4_data:           cf4 || {},
+        cf5_data:           explorerResult || {},
+        tau_magnitudes:     tauMags,
+        uncertainty_values: uncMags,
+      }),
     });
+    if (!res.ok) { alert(`Report generation failed: ${res.status}`); return; }
     const blob = await res.blob();
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
     a.download = `shear_report_${lastGtype}.pdf`; a.click();
-  }, [result, lastGtype, lastParams, explorerResult]);
-
-  const cf4Live = result ? computeCF4(result.mean_tau, result.variance_tau, result.grad_u) : null;
-  const showProgress = progressMsgs.length > 0 || progressError;
+  }, [result, lastGtype, lastParams, explorerResult, cf4Live]);
 
   return (
     <div className="flex h-full" style={{ marginRight: copilotOpen ? '320px' : 0, transition: 'margin 0.3s ease' }}>
 
       {/* ── Left sidebar ─────────────────────────────────────── */}
       <aside className="w-64 shrink-0 glass-dark flex flex-col overflow-hidden">
-
-        {/* Brand */}
-        <div className="px-5 pt-6 pb-5 border-b border-white/[0.06]">
-          <div className="text-xl font-display font-bold text-gradient tracking-tight">SHEAR</div>
-          <div className="text-xs text-slate-500 mt-1 leading-relaxed">SE(3)-Equivariant Turbulence<br/>Flow Intelligence</div>
-        </div>
 
         {/* Form */}
         <div className="flex-1 overflow-y-auto px-4 py-4">
@@ -156,6 +184,10 @@ export default function InferencePage({ onResult }) {
             onExplore={handleExplore}
             isRunning={isRunning}
             isExploring={isExploring}
+            gtype={gtype}
+            params={formParams}
+            onGtypeChange={onGtypeChange}
+            onParamsChange={onFormParamsChange}
           />
         </div>
 
@@ -205,19 +237,28 @@ export default function InferencePage({ onResult }) {
           </button>
         </div>
 
-        {/* Panel */}
-        <div className="flex-1 min-h-0">
+        {/* Panel — position:relative so overlays are scoped here */}
+        <div className="flex-1 min-h-0 relative">
           {activeTab === 0 && <StressViewer result={result} />}
           {activeTab === 1 && <CF4Panel result={result} />}
           {activeTab === 2 && <AF1Panel result={result} af1Data={result?._af1 ?? null} />}
           {activeTab === 3 && <CF5Explorer explorerResult={explorerResult} />}
+
+          {/* V1 Analysis loading overlay */}
+          <InferenceLoadingOverlay
+            isRunning={isRunning}
+            messages={progressMsgs}
+            progress={progress}
+            error={progressError}
+          />
+
+          {/* Explorer loading overlay */}
+          <ExplorerLoadingOverlay
+            isExploring={isExploring}
+            error={null}
+          />
         </div>
       </div>
-
-      {/* ── Progress toast ────────────────────────────────────── */}
-      {showProgress && (
-        <ProgressTracker messages={progressMsgs} progress={progress} error={progressError} />
-      )}
 
       {/* ── AI Copilot panel ─────────────────────────────────── */}
       <CopilotPanel

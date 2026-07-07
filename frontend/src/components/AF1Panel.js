@@ -33,7 +33,7 @@ function RegimeAccuracyCard({ regime, r }) {
       <div className="text-xl font-bold font-mono font-display" style={{ color }}>
         r = {r.toFixed(3)}
       </div>
-      <div className="text-xs text-slate-600">Pearson r from Task 3</div>
+      <div className="text-xs text-slate-600">Prediction correlation</div>
     </div>
   );
 }
@@ -153,7 +153,7 @@ export default function AF1Panel({ result, af1Data }) {
       {/* Per-regime Pearson r */}
       <div>
         <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
-          V1 Accuracy by Regime — Task 3 Evaluation
+          Prediction Accuracy by Vorticity Regime
         </div>
         <div className="grid grid-cols-3 gap-3">
           <RegimeAccuracyCard regime="low"    r={pr.low    ?? REGIME_PEARSON.low}    />

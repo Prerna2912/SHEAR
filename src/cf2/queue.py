@@ -44,6 +44,7 @@ class Job:
     ode_steps: int
     grid_size: int
     include_samples: bool
+    ode_method: str = "dopri5"
     status: JobStatus = JobStatus.QUEUED
     result: Optional[InferenceResult] = None
     error: Optional[str] = None
@@ -194,6 +195,7 @@ def _blocking_inference(job: Job, progress_fn: Callable) -> InferenceResult:
         device=device,
         n_samples=job.n_samples,
         ode_steps=job.ode_steps,
+        ode_method=job.ode_method,
         progress_fn=progress_fn,
         include_samples=job.include_samples,
     )
@@ -248,9 +250,10 @@ def make_job(
     ode_steps: int = 100,
     grid_size: int = 16,
     include_samples: bool = False,
+    ode_method: str = "dopri5",
 ) -> Job:
     from .inference import geometry_hash
-    ghash = geometry_hash(geometry_type, params)
+    ghash = geometry_hash(geometry_type, params, grid_size=grid_size)
     return Job(
         job_id=str(uuid.uuid4()),
         geometry_type=geometry_type,
@@ -260,4 +263,5 @@ def make_job(
         ode_steps=ode_steps,
         grid_size=grid_size,
         include_samples=include_samples,
+        ode_method=ode_method,
     )

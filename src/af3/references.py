@@ -111,20 +111,27 @@ def get_reference(ref_id: str) -> Optional[dict]:
     path = _ref_path(ref_id)
 
     if not path.exists():
-        # compute from CF1 if available, else use mock
+        import hashlib
+        seed = int(hashlib.md5(ref_id.encode()).hexdigest()[:8], 16)
+        mock = _mock_field(meta["params"], meta["geometry_type"], seed=seed)
+
+        # Use CF1 for spatial positions and grad_u if available, mock for stress fields
         try:
             from src.cf1.solver import solve
             cf1 = solve(meta["geometry_type"], meta["params"], grid_size=8)
-            field = {
-                "mean_tau":     np.zeros((len(cf1.positions), 6), dtype=np.float32),
-                "variance_tau": np.zeros((len(cf1.positions), 6), dtype=np.float32),
-                "positions":    np.array(cf1.positions, dtype=np.float32),
-                "grad_u":       cf1.grad_u.astype(np.float32),
-                "metrics":      {"peak_tau": 0.0, "mean_tau": 0.0, "backscatter_frac": 0.0, "dominant_regime": 0},
-            }
+            positions = np.array(cf1.positions, dtype=np.float32)
+            grad_u    = cf1.grad_u.astype(np.float32)
         except Exception:
-            seed = hash(ref_id) % (2**31)
-            field = _mock_field(meta["params"], meta["geometry_type"], seed=seed)
+            positions = mock["positions"]
+            grad_u    = mock["grad_u"]
+
+        field = {
+            "mean_tau":     mock["mean_tau"],
+            "variance_tau": mock["variance_tau"],
+            "positions":    positions,
+            "grad_u":       grad_u,
+            "metrics":      mock["metrics"],
+        }
 
         np.savez_compressed(
             path,
@@ -181,6 +188,8 @@ def compare(
     sub_r = mag_ref[idx_r]
 
     r, _ = pearsonr(sub_e, sub_r)
+    if np.isnan(r) or np.isinf(r):
+        r = 0.0
     diff  = (sub_e - sub_r).tolist()
 
     return ComparisonResult(

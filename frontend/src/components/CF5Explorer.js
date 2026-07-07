@@ -236,6 +236,7 @@ export default function CF5Explorer({ explorerResult }) {
           ))}
 
           <ParameterAnimator
+            key={selectedParam}
             ranking={ranking}
             activeParam={selectedParam}
           />

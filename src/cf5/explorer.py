@@ -103,17 +103,18 @@ def _safe_perturb(key: str, base: float, factor: float) -> float:
 def run_explorer_sync(
     geometry_type: str,
     base_params: Dict[str, Any],
-    n_samples: int = 10,
-    grid_size: int = 16,
-    perturbation_levels: Tuple[float, ...] = (0.05, 0.10, 0.20),
+    n_samples: int = 5,
+    grid_size: int = 4,
+    ode_steps: int = 10,
+    ode_method: str = "euler",
+    perturbation_levels: Tuple[float, ...] = (0.10, 0.20),
     interaction_levels: Tuple[float, ...] = (-0.20, -0.10, 0.0, 0.10, 0.20),
 ) -> ExplorerResult:
     """
     Run parametric sensitivity analysis and 2D interaction map.
 
-    n_samples is intentionally lower than the default CF2 value (20) to
-    keep wall-time manageable.  The ranking and interaction map use the same
-    V1 model and cache as the main inference path.
+    Uses fast euler ODE with low n_samples/grid_size/ode_steps — sensitivity
+    ranking only needs relative Δpeak_tau, not high-fidelity stress values.
     """
     from src.cf2.queue import _blocking_inference, make_job
 
@@ -122,7 +123,8 @@ def run_explorer_sync(
 
     def infer(ptype: str, pparams: dict):
         nonlocal n_calls
-        job = make_job(ptype, pparams, n_samples=n_samples, grid_size=grid_size)
+        job = make_job(ptype, pparams, n_samples=n_samples, grid_size=grid_size,
+                       ode_steps=ode_steps, ode_method=ode_method)
         n_calls += 1
         return _blocking_inference(job, lambda c, t: None)
 

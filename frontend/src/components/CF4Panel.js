@@ -88,7 +88,7 @@ export default function CF4Panel({ result }) {
         <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-indigo-500/20 to-teal-500/20 flex items-center justify-center border border-white/[0.07]">
           <span className="text-xl">⚡</span>
         </div>
-        <div className="text-slate-500 text-xs">Run V1 analysis to see CF4 diagnostics.</div>
+        <div className="text-slate-500 text-xs">Run V1 analysis to see flow diagnostics.</div>
       </div>
     );
   }

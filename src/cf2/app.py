@@ -116,17 +116,27 @@ async def submit_inference(request: GeometryRequest):
     """
     from .inference import geometry_hash
 
-    ghash = geometry_hash(request.geometry_type, request.params)
+    ghash = geometry_hash(request.geometry_type, request.params, grid_size=request.grid_size)
 
-    # Cache hit: return a synthetic job that is immediately complete
-
-     cache = get_cache()
+    # Cache hit — create a pre-completed job so WebSocket and polling can retrieve it
+    cache = get_cache()
     cached = cache.get(ghash)
     if cached is not None:
-        import uuid
-        job_id = str(uuid.uuid4())
+        job = make_job(
+            geometry_type=request.geometry_type,
+            params=dict(request.params),
+            n_samples=request.n_samples,
+            ode_steps=request.ode_steps,
+            grid_size=request.grid_size,
+            include_samples=request.include_samples,
+            ode_method=request.ode_method,
+        )
+        job.result = cached
+        job.status = JobStatus.COMPLETE
+        queue = get_queue()
+        queue._jobs[job.job_id] = job
         return JobResponse(
-            job_id=job_id,
+            job_id=job.job_id,
             status=JobStatus.COMPLETE,
             geometry_hash=ghash,
         )
@@ -138,6 +148,7 @@ async def submit_inference(request: GeometryRequest):
         ode_steps=request.ode_steps,
         grid_size=request.grid_size,
         include_samples=request.include_samples,
+        ode_method=request.ode_method,
     )
 
     queue = get_queue()
@@ -339,6 +350,8 @@ async def run_explorer(request: ExplorerJobRequest):
         request.params,
         request.n_samples,
         request.grid_size,
+        request.ode_steps,
+        request.ode_method,
     )
 
     # Convert dataclasses → Pydantic models
@@ -459,26 +472,33 @@ async def compare_geometry(req: CompareRequest):
 # ---------------------------------------------------------------------------
 
 class ReportRequest(_BM):
-    geometry_type: str
-    params:        dict
-    metrics:       dict
-    cf4_data:      dict = {}
-    cf5_data:      dict = {}
+    geometry_type:      str
+    params:             dict
+    metrics:            dict = {}
+    cf4_data:           dict = {}
+    cf5_data:           dict = {}
+    tau_magnitudes:     list = []
+    uncertainty_values: list = []
 
 @app.post("/api/v1/report")
 async def download_report(req: ReportRequest):
     """Generate and return a multi-page PDF report for the current analysis."""
     from src.af4.report import generate_pdf
+    import functools
 
     loop = asyncio.get_event_loop()
     pdf_bytes = await loop.run_in_executor(
         None,
-        generate_pdf,
-        req.geometry_type,
-        req.params,
-        req.metrics,
-        req.cf4_data or None,
-        req.cf5_data or None,
+        functools.partial(
+            generate_pdf,
+            geometry_type=req.geometry_type,
+            params=req.params,
+            metrics=req.metrics,
+            cf4_data=req.cf4_data or None,
+            cf5_data=req.cf5_data or None,
+            tau_magnitudes=req.tau_magnitudes or None,
+            uncertainty_values=req.uncertainty_values or None,
+        ),
     )
     filename = f"shear_{req.geometry_type}_{req.params}.pdf".replace(" ", "_")[:80]
     return Response(

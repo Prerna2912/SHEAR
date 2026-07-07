@@ -33,10 +33,10 @@ from torch_geometric.data import Data, Batch
 # Geometry hash (cache key)
 # ---------------------------------------------------------------------------
 
-def geometry_hash(geometry_type: str, params: dict) -> str:
-    """SHA-256 of the canonical geometry params dict (stable across sessions)."""
+def geometry_hash(geometry_type: str, params: dict, grid_size: int = 16) -> str:
+    """SHA-256 of the canonical geometry params dict + grid resolution."""
     canonical = json.dumps(
-        {"geometry_type": geometry_type, **params},
+        {"geometry_type": geometry_type, "grid_size": grid_size, **params},
         sort_keys=True,
         default=str,      # handle non-JSON types (e.g. numpy scalars)
     )

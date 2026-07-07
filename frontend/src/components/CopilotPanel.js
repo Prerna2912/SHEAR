@@ -73,16 +73,22 @@ export default function CopilotPanel({ result, cf4, explorerResult, af1, geometr
     const q = question.trim();
     if (!q) return;
     setInput('');
-    setMessages(prev => [...prev, { role: 'user', content: q }]);
-    setTyping(true);
-    try {
-      const answer = await getResponse(q, context);
-      setMessages(prev => [...prev, { role: 'assistant', content: answer }]);
-    } catch (e) {
-      setMessages(prev => [...prev, { role: 'assistant', content: `Error: ${e.message}` }]);
-    } finally {
-      setTyping(false);
-    }
+    setMessages(prev => {
+      const updated = [...prev, { role: 'user', content: q }];
+      // Fire async separately so we have the updated history
+      (async () => {
+        setTyping(true);
+        try {
+          const answer = await getResponse(q, context, updated);
+          setMessages(m => [...m, { role: 'assistant', content: answer }]);
+        } catch (e) {
+          setMessages(m => [...m, { role: 'assistant', content: `Error: ${e.message}` }]);
+        } finally {
+          setTyping(false);
+        }
+      })();
+      return updated;
+    });
   }, [context]);
 
   if (!isOpen) return null;

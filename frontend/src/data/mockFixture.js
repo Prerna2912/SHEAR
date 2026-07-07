@@ -94,30 +94,47 @@ export function generateMockExplorerResult(geometryType, params) {
 
   const levels = [-0.20, -0.10, -0.05, 0.05, 0.10, 0.20];
 
+  // Different curve shapes per parameter index so charts are visually distinct
+  const SHAPES = [
+    lv => 0.52 + 0.18 * lv + 0.22 * lv * lv,                      // convex upward (stiff param)
+    lv => 0.52 - 0.14 * lv + 0.08 * Math.sin(lv * Math.PI * 3),   // oscillatory (resonance-like)
+    lv => 0.52 + 0.26 * Math.tanh(lv * 4),                         // saturating (nonlinear clamp)
+    lv => 0.52 + 0.10 * lv - 0.30 * lv * lv,                       // concave (optimal at midrange)
+    lv => 0.52 + 0.08 * lv,                                         // weak linear
+  ];
+
   const paramRanking = numeric.map(([pname, bval], i) => {
-    const sens = (numeric.length - i) * 0.12 + 0.04 + 0.05 * rand();
+    const shape = SHAPES[i % SHAPES.length];
+    const perturbList = levels.map(lv => ({
+      level: lv,
+      param: pname,
+      new_value: bval * (1 + lv),
+      delta_peak_tau: shape(lv) - shape(0),
+      peak_tau: shape(lv) * (1 + 0.015 * (rand() - 0.5)),
+    }));
+    const maxDelta = Math.max(...perturbList.map(p => Math.abs(p.delta_peak_tau)));
     return {
       param: pname,
       base_value: bval,
-      max_abs_delta: sens * 0.20,
-      perturbations: levels.map(lv => ({
-        level: lv,
-        param: pname,
-        new_value: bval * (1 + lv),
-        delta_peak_tau: sens * lv * (1 + 0.08 * (rand() - 0.5)),
-        peak_tau: 0.48 + sens * lv * 0.5,
-      })),
+      max_abs_delta: maxDelta,
+      perturbations: perturbList,
     };
   });
 
   paramRanking.sort((a, b) => b.max_abs_delta - a.max_abs_delta);
 
   const iLevels = [-0.20, -0.10, 0.0, 0.10, 0.20];
-  const sa = paramRanking[0]?.max_abs_delta ?? 0.1;
-  const sb = paramRanking[1]?.max_abs_delta ?? 0.05;
+  const shapeA = SHAPES[0];
+  const shapeB = SHAPES[1 % SHAPES.length];
 
   const grid = iLevels.map(fa =>
-    iLevels.map(fb => (sa * fa + sb * fb) * (1 + 0.05 * (rand() - 0.5)))
+    iLevels.map(fb => {
+      const da = shapeA(fa) - shapeA(0);
+      const db = shapeB(fb) - shapeB(0);
+      // Interaction term: cross-effect that makes the heatmap non-separable
+      const interaction = 0.06 * fa * fb * (1 + 0.1 * (rand() - 0.5));
+      return da + db + interaction;
+    })
   );
 
   return {
