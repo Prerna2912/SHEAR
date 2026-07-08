@@ -1,11 +1,12 @@
 /**
  * SHEAR AI Copilot — response engine.
  *
- * Primary:  Claude Haiku via REACT_APP_CLAUDE_API_KEY (set in .env.local).
+ * Primary:  Groq (free tier) via REACT_APP_GROQ_API_KEY (set in .env.local).
+ *           Get a free key at https://console.groq.com
  * Fallback: context-aware rule engine using live analysis data.
  */
 
-const CLAUDE_KEY = process.env.REACT_APP_CLAUDE_API_KEY;
+const GROQ_KEY = process.env.REACT_APP_GROQ_API_KEY;
 
 export const QUICK_QUESTIONS = [
   'Is this design safe?',
@@ -148,17 +149,9 @@ function ruleBasedResponse(question, ctx) {
   return lines.join('\n');
 }
 
-// ── Claude API path ───────────────────────────────────────────────
-async function claudeResponse(question, ctx, history) {
-  const systemPrompt = `You are SHEAR Copilot, an expert AI assistant embedded in a turbulence flow intelligence platform for aerospace, automotive, and marine engineers.
-
-You interpret predictions from a SE(3)-equivariant conditional flow matching model that predicts sub-grid scale stress tensors for large eddy simulation.
-
-Rules:
-- Speak in precise, confident engineering language. Avoid jargon like "CF4", "AF1", "CF5", "Task 3" — use plain names (diagnostics panel, flow regime analysis, sensitivity explorer).
-- Keep answers to 3–6 sentences with key numbers bolded.
-- Never suggest specific parameter values — describe trends only.
-
+// ── Groq API path ─────────────────────────────────────────────────
+async function groqResponse(question, ctx, history) {
+  const contextBlock = ctx ? `
 Current analysis context:
 - Geometry: ${ctx.geometryType} | Parameters: ${JSON.stringify(ctx.params)}
 - Peak |τ|: ${ctx.peakTau?.toFixed(4)} | Mean |τ|: ${ctx.meanTau?.toFixed(4)}
@@ -168,25 +161,34 @@ Current analysis context:
 - Mean SGS dissipation: ${ctx.meanDissipation?.toFixed(5) ?? 'not computed'}
 - Out-of-distribution: ${ctx.isOOD ? `YES (${ctx.mahal?.toFixed(2)}σ from training data)` : 'No — in distribution'}
 - Most sensitive parameter: ${ctx.topParam?.param ?? 'sensitivity explorer not run'} (effect = ${ctx.topDelta?.toFixed(4) ?? '—'})
-- Grid nodes: ${ctx.nNodes}`;
+- Grid nodes: ${ctx.nNodes}` : 'No analysis has been run yet — answer general questions about the tool, methodology, or geometry setup.';
+
+  const systemPrompt = `You are SHEAR Copilot, an expert AI assistant embedded in a turbulence flow intelligence platform for aerospace, automotive, and marine engineers.
+
+You interpret predictions from a SE(3)-equivariant conditional flow matching model that predicts sub-grid scale stress tensors for large eddy simulation.
+
+Rules:
+- Speak in precise, confident engineering language. Avoid jargon like "CF4", "AF1", "CF5", "Task 3" — use plain names (diagnostics panel, flow regime analysis, sensitivity explorer).
+- Keep answers to 3–6 sentences with key numbers bolded.
+- Never suggest specific parameter values — describe trends only.
+
+${contextBlock}`;
 
   const messages = [
+    { role: 'system', content: systemPrompt },
     ...history.slice(-6).map(m => ({ role: m.role, content: m.content })),
     { role: 'user', content: question },
   ];
 
-  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+  const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
-      'x-api-key': CLAUDE_KEY,
-      'anthropic-version': '2023-06-01',
-      'anthropic-dangerous-direct-browser-access': 'true',
-      'content-type': 'application/json',
+      'Authorization': `Bearer ${GROQ_KEY}`,
+      'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      model: 'claude-haiku-4-5-20251001',
+      model: 'llama-3.3-70b-versatile',
       max_tokens: 400,
-      system: systemPrompt,
       messages,
     }),
   });
@@ -196,22 +198,23 @@ Current analysis context:
     throw new Error(err.error?.message ?? `HTTP ${resp.status}`);
   }
   const data = await resp.json();
-  return data.content?.[0]?.text ?? '(empty response)';
+  return data.choices?.[0]?.message?.content ?? '(empty response)';
 }
 
 // ── Public API ────────────────────────────────────────────────────
 export async function getResponse(question, context, history = []) {
-  if (!context) {
-    return 'Run a V1 analysis first — submit a geometry in the left sidebar and I\'ll help you interpret the results.';
-  }
-
-  if (CLAUDE_KEY) {
+  if (GROQ_KEY) {
     try {
-      return await claudeResponse(question, context, history);
+      return await groqResponse(question, context, history);
     } catch (e) {
-      console.warn('Claude API error:', e.message);
+      console.warn('Groq API error:', e.message);
+      if (!context) return 'I\'m having trouble connecting right now. Try running a V1 analysis first and then ask me questions about the results.';
       return ruleBasedResponse(question, context) + `\n\n*Using local engine (${e.message}).*`;
     }
+  }
+
+  if (!context) {
+    return 'Run a V1 analysis first — submit a geometry in the left sidebar and I\'ll help you interpret the results.';
   }
 
   return ruleBasedResponse(question, context);

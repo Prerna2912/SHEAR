@@ -73,23 +73,21 @@ export default function CopilotPanel({ result, cf4, explorerResult, af1, geometr
     const q = question.trim();
     if (!q) return;
     setInput('');
-    setMessages(prev => {
-      const updated = [...prev, { role: 'user', content: q }];
-      // Fire async separately so we have the updated history
-      (async () => {
-        setTyping(true);
-        try {
-          const answer = await getResponse(q, context, updated);
-          setMessages(m => [...m, { role: 'assistant', content: answer }]);
-        } catch (e) {
-          setMessages(m => [...m, { role: 'assistant', content: `Error: ${e.message}` }]);
-        } finally {
-          setTyping(false);
-        }
-      })();
-      return updated;
-    });
-  }, [context]);
+
+    const userMsg = { role: 'user', content: q };
+    const updatedHistory = [...messages, userMsg];
+    setMessages(updatedHistory);
+
+    setTyping(true);
+    try {
+      const answer = await getResponse(q, context, updatedHistory);
+      setMessages(m => [...m, { role: 'assistant', content: answer }]);
+    } catch (e) {
+      setMessages(m => [...m, { role: 'assistant', content: `Error: ${e.message}` }]);
+    } finally {
+      setTyping(false);
+    }
+  }, [context, messages]);
 
   if (!isOpen) return null;
 
@@ -101,7 +99,7 @@ export default function CopilotPanel({ result, cf4, explorerResult, af1, geometr
           <div className="w-7 h-7 rounded-full bg-gradient-to-br from-teal-400 to-indigo-500 flex items-center justify-center text-white text-xs font-bold">S</div>
           <div>
             <div className="text-sm font-semibold font-display text-white">SHEAR Copilot</div>
-            <div className="text-xs text-slate-500">{process.env.REACT_APP_CLAUDE_API_KEY ? 'Powered by Claude' : 'Engineering AI'}</div>
+            <div className="text-xs text-slate-500">{process.env.REACT_APP_GROQ_API_KEY ? 'Powered by Llama 3.3' : 'Engineering AI'}</div>
           </div>
         </div>
         <button onClick={onClose} className="text-slate-500 hover:text-slate-300 transition-colors text-lg">✕</button>
