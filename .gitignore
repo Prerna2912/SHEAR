@@ -108,3 +108,6 @@ figures/*.pdf
 results/*
 !results/.gitkeep
 !figures/.gitkeep
+
+# Runtime user data
+data/
