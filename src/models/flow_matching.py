@@ -73,6 +73,10 @@ class EGNNFlowMatching(nn.Module):
         self.ode_rtol = ode_rtol
         self.ode_atol = ode_atol
 
+    @property
+    def n_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
     def _vf_forward(
         self,
         x_t: torch.Tensor,
@@ -181,6 +185,10 @@ class MLPFlowMatching(nn.Module):
         self.cfm = ConditionalFlowMatcher()
         self.ode_rtol = ode_rtol
         self.ode_atol = ode_atol
+
+    @property
+    def n_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
 
     def loss(self, grad_flat: torch.Tensor, tau_flat: torch.Tensor) -> torch.Tensor:
         """

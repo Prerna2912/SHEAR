@@ -2,20 +2,21 @@
 variant: v2
 
 model:
-  irreps_hidden: "32x0e + 16x1o + 8x2e"  # identical architecture to V1
-  n_layers: 5
+  irreps_hidden: "16x0e + 8x1e + 4x2e"  # ~1.3M params (hardware fallback per spec)
+  n_layers: 4
   lmax_sh: 2
   n_radial_hidden: 64
 
 training:
   lr: 1.0e-3
   weight_decay: 1.0e-4
-  total_steps: 50000
+  total_steps: 10000
   warmup_fraction: 0.05
   val_every: 500
   log_every: 100
   grad_clip: 1.0
-  batch_size: 16
+  batch_size: 1
+  accumulation_steps: 32  # effective batch = 32
 
 data:
   n_train: 4000

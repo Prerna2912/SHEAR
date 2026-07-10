@@ -28,6 +28,7 @@ def collect_predictions(
     variant: str,
     device: torch.device,
     n_ode_steps: int = 100,
+    stats: Optional[dict] = None,
 ) -> tuple:
     """
     Run inference on the full test set and return stacked tensors.
@@ -56,6 +57,11 @@ def collect_predictions(
             batch = batch.to(device)
             grad3x3 = batch.grad_full.reshape(-1, 3, 3)
             grad_irr = grad_to_irreps(grad3x3)
+            # Normalise gradient to match training distribution
+            if stats is not None:
+                x_mean = stats['x_mean'].to(device)
+                x_std  = stats['x_std'].to(device)
+                grad_irr = (grad_irr - x_mean) / x_std
             pred = model.sample(grad_irr)   # MLPFlowMatching.sample takes no n_steps arg
 
         preds_irr.append(pred.cpu())
@@ -301,7 +307,7 @@ def compute_all_metrics(
     """
     print(f"  Collecting predictions ({variant.upper()})...")
     pred_irr, true_irr, pred_3x3, true_3x3 = collect_predictions(
-        model, test_loader, variant, device
+        model, test_loader, variant, device, stats=stats
     )
 
     # Denormalize if stats provided
@@ -396,8 +402,8 @@ def backscatter_fraction(
     Returns:
         Scalar fraction in [0, 1].
     """
-    Pi = sgs_dissipation(pred_3x3, grad_3x3)   # [N]
-    return float((Pi > 0).float().mean().item())
+    Pi = sgs_dissipation(pred_3x3, grad_3x3)   # [N]; positive = forward scatter
+    return float((Pi < 0).float().mean().item())
 
 
 # ------------------------------------------------------------------

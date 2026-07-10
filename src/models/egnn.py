@@ -11,7 +11,8 @@ Architecture:
   - Irreps output projection
 
 Input node features:
-  - Velocity gradient: "1x0e + 1x1o + 1x2e"  (9 components)
+  - Velocity gradient: "1x0e + 1x1e + 1x2e"  (9 components)
+    (0e=trace, 1e=antisym/vorticity axial vector, 2e=sym traceless)
   - [V1 only] Noisy stress x_t: "1x0e + 1x2e" (6 components)
   - [V1 only] Time t:  "1x0e"                  (1 component)
 
@@ -21,14 +22,15 @@ Output:
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as grad_ckpt
 from e3nn import o3
 from e3nn.nn import BatchNorm as E3BatchNorm
 from torch_geometric.nn import MessagePassing
-from torch_geometric.utils import scatter
 
 
-# Irreps used throughout
-IRREPS_GRAD  = o3.Irreps("1x0e + 1x1o + 1x2e")   # velocity gradient (9)
+# Irreps used throughout.
+# Gradient: 1o⊗1o = 0e + 1e + 2e (antisymmetric part is axial vector → 1e)
+IRREPS_GRAD  = o3.Irreps("1x0e + 1x1e + 1x2e")   # velocity gradient (9)
 IRREPS_STRESS = o3.Irreps("1x0e + 1x2e")           # SGS stress (6)
 IRREPS_TIME  = o3.Irreps("1x0e")                   # time scalar (1)
 

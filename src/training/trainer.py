@@ -16,6 +16,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch_geometric.data import Batch
@@ -47,6 +48,7 @@ class Trainer:
         val_every=500,
         log_every=100,
         grad_clip=1.0,
+        accumulation_steps=1,
     )
 
     def __init__(
@@ -58,6 +60,7 @@ class Trainer:
         cfg: Optional[dict] = None,
         device: torch.device = torch.device('cpu'),
         out_dir: str = './runs',
+        stats: Optional[dict] = None,
     ):
         self.model = model.to(device)
         self.variant = variant.lower()
@@ -66,12 +69,14 @@ class Trainer:
         self.device = device
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.stats = stats  # used by V3 to normalise rotated targets
 
         hparams = {**self.DEFAULTS, **(cfg or {})}
         self.total_steps = hparams['total_steps']
         self.val_every = hparams['val_every']
         self.log_every = hparams['log_every']
         self.grad_clip = hparams['grad_clip']
+        self.accumulation_steps = int(hparams.get('accumulation_steps', 1))
 
         self.optimizer = AdamW(
             model.parameters(),
@@ -86,6 +91,10 @@ class Trainer:
         self.global_step = 0
         self.best_val_loss = float('inf')
         self.history = {'train_loss': [], 'val_loss': [], 'lr': []}
+
+        # Mixed precision: enabled on CUDA, disabled on CPU
+        self.use_amp = device.type == 'cuda'
+        self.scaler = GradScaler('cuda', enabled=self.use_amp)
 
         # V3: precompute rotation matrices on device
         if self.variant == 'v3':
@@ -114,17 +123,14 @@ class Trainer:
 
     def _prepare_batch_v3(self, batch: Batch):
         """
-        Flatten graph into per-node tensors and apply a random cubic rotation.
+        Flatten graph into per-node tensors, apply a random cubic rotation,
+        then normalise to match the stats used by V1/V2 (batch.x / batch.y).
         """
         batch = batch.to(self.device)
 
-        # Reconstruct 3x3 tensors from irreps storage
-        # .grad_full [N, 9], .tau_full [N, 9]
-        grad_flat = batch.grad_full   # [N, 9]  (flat 3x3, not irreps)
-        tau_full  = batch.tau_full    # [N, 9]
-
-        grad3x3 = grad_flat.reshape(-1, 3, 3)
-        tau3x3  = tau_full.reshape(-1, 3, 3)
+        # Reconstruct raw 3x3 tensors (tau_full / grad_full are unnormalised)
+        grad3x3 = batch.grad_full.reshape(-1, 3, 3)
+        tau3x3  = batch.tau_full.reshape(-1, 3, 3)
 
         # Random rotation from the 24 cubic group
         idx = torch.randint(0, 24, (1,)).item()
@@ -133,10 +139,19 @@ class Trainer:
         grad3x3 = R @ grad3x3 @ R.T     # [N, 3, 3]
         tau3x3  = R @ tau3x3  @ R.T     # [N, 3, 3]
 
-        # Convert to irreps for the MLP
         from data.dataset import grad_to_irreps, stress_to_irreps
         grad_irr = grad_to_irreps(grad3x3)    # [N, 9]
         tau_irr  = stress_to_irreps(tau3x3)   # [N, 6]
+
+        # Normalise to the same scale as batch.x / batch.y so that V3 trains
+        # on standardised targets, consistent with V1 and V2.
+        if self.stats is not None:
+            x_mean = self.stats['x_mean'].to(self.device)
+            x_std  = self.stats['x_std'].to(self.device)
+            y_mean = self.stats['y_mean'].to(self.device)
+            y_std  = self.stats['y_std'].to(self.device)
+            grad_irr = (grad_irr - x_mean) / x_std
+            tau_irr  = (tau_irr  - y_mean) / y_std
 
         return grad_irr, tau_irr
 
@@ -144,33 +159,36 @@ class Trainer:
     # Single training step
     # ------------------------------------------------------------------
 
-    def _train_step(self, batch) -> float:
-        self.model.train()
-        self.optimizer.zero_grad(set_to_none=True)
-
+    def _forward_loss(self, batch) -> torch.Tensor:
+        """Single forward pass; returns unscaled loss."""
         if self.variant == 'v1':
             batch = self._prepare_batch_v1(batch)
-            loss = self.model.loss(batch)
-
+            return self.model.loss(batch)
         elif self.variant == 'v2':
             batch = self._prepare_batch_v2(batch)
-            pred = self.model(
-                x=batch.x,
-                pos=batch.pos,
-                edge_index=batch.edge_index,
-            )
-            loss = mse_loss(pred, batch.y)
-
+            pred = self.model(x=batch.x, pos=batch.pos, edge_index=batch.edge_index)
+            return mse_loss(pred, batch.y)
         elif self.variant == 'v3':
             grad_irr, tau_irr = self._prepare_batch_v3(batch)
-            loss = self.model.loss(grad_irr, tau_irr)
+            return self.model.loss(grad_irr, tau_irr)
 
-        loss.backward()
+    def _train_step(self, batches: list) -> float:
+        """One optimizer update over `accumulation_steps` mini-batches."""
+        self.model.train()
+        self.optimizer.zero_grad(set_to_none=True)
+        total_loss = 0.0
+        for batch in batches:
+            with autocast('cuda', enabled=self.use_amp):
+                loss = self._forward_loss(batch) / self.accumulation_steps
+            self.scaler.scale(loss).backward()
+            total_loss += loss.item()
+        self.scaler.unscale_(self.optimizer)
         nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
         self._apply_warmup()
-        self.optimizer.step()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
         self.scheduler.step()
-        return loss.item()
+        return total_loss
 
     # ------------------------------------------------------------------
     # Validation
@@ -216,14 +234,17 @@ class Trainer:
         loader_iter = iter(self.train_loader)
         t_start = time.time()
 
-        while self.global_step < self.total_steps:
+        def _next_batch():
+            nonlocal loader_iter
             try:
-                batch = next(loader_iter)
+                return next(loader_iter)
             except StopIteration:
                 loader_iter = iter(self.train_loader)
-                batch = next(loader_iter)
+                return next(loader_iter)
 
-            loss = self._train_step(batch)
+        while self.global_step < self.total_steps:
+            batches = [_next_batch() for _ in range(self.accumulation_steps)]
+            loss = self._train_step(batches)
             self.global_step += 1
             self.history['train_loss'].append(loss)
             self.history['lr'].append(self.optimizer.param_groups[0]['lr'])
@@ -234,6 +255,7 @@ class Trainer:
                       f"loss={loss:.6f} | "
                       f"lr={self.optimizer.param_groups[0]['lr']:.2e} | "
                       f"elapsed={elapsed:.0f}s")
+                self._save_checkpoint('last.pt')
 
             if self.global_step % self.val_every == 0:
                 val_loss = self._validate()
@@ -258,6 +280,7 @@ class Trainer:
             'model_state': self.model.state_dict(),
             'optimizer_state': self.optimizer.state_dict(),
             'scheduler_state': self.scheduler.state_dict(),
+            'scaler_state': self.scaler.state_dict(),
             'val_loss': self.best_val_loss,
             'variant': self.variant,
         }
@@ -268,6 +291,8 @@ class Trainer:
         self.model.load_state_dict(ckpt['model_state'])
         self.optimizer.load_state_dict(ckpt['optimizer_state'])
         self.scheduler.load_state_dict(ckpt['scheduler_state'])
+        if 'scaler_state' in ckpt:
+            self.scaler.load_state_dict(ckpt['scaler_state'])
         self.global_step = ckpt['step']
         self.best_val_loss = ckpt.get('val_loss', float('inf'))
         print(f"Loaded checkpoint from step {self.global_step}")
